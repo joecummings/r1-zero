@@ -11,6 +11,7 @@ import torch
 from torchtune.modules.transforms.tokenizers import ModelTokenizer
 
 
+# TODO: fn should have better name or pass "think" as a param
 def extract_tags(text: str) -> dict[str, list[str]]:
     """
     Parse XML-like tags from text. Returns a dictionary with keys 'think' and 'answer'.
@@ -45,6 +46,7 @@ def shaped_correctness_reward(answer: str, completion: str) -> tuple[float, floa
     success = 0.0
 
     try:
+        # TODO: is it safe to replace "<<" and ">>"? What if the answer contains these characters?
         tags = extract_tags("<think>" + completion.replace("<<", "").replace(">>", ""))
     except ET.ParseError:
         tags = {"think": [], "answer": []}
@@ -79,6 +81,8 @@ def batch_shaped_correctness_reward(
     rewards = torch.zeros(batch_size, grpo_size, dtype=torch.float32)
     successes = torch.zeros(batch_size, grpo_size, dtype=torch.float32)
     # completions :: [B, G, L]
+    # TODO: can we do tokernizer.decode in parallel?
+    # TODO: can we parallelize shaped_correctness_reward?
     for b in range(batch_size):
         for g in range(grpo_size):
             text_completion = tokenizer.decode(

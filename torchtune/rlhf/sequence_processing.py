@@ -191,5 +191,6 @@ def truncate_sequence_for_logprobs(
         context_length (int): The length of the context.
 
     Returns:
-        torch.Tensor: The truncated logits for the response with shape [b, response_length, vocab_size]."""
+        torch.Tensor: The truncated logits for the response with shape [b, response_length, vocab_size].
+    """
     return query_response_logits[:, context_length - 1 : -1]

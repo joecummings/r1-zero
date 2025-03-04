@@ -727,6 +727,9 @@ class FullGRPOFinetuneRecipeDistributed(FTRecipeInterface):
             dtype=self._dtype,
             decoder_max_seq_len=context_length + self._max_generated_tokens,
         ):
+            # TODO: we run with return_logits=False here, and then compute it again a few lines below
+            # maybe a limitation of our implementation?
+            # context: https://github.com/pytorch/torchtune/pull/2326#issuecomment-2654764506
             query_responses, _ = generate(  # [B x G, L], [B x G, L, V]
                 model=self._model,
                 prompt=batch_input_ids,
