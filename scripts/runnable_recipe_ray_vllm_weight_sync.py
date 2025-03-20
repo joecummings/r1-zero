@@ -1,3 +1,9 @@
+# Copyright (c) Meta Platforms, Inc. and affiliates.
+# All rights reserved.
+#
+# This source code is licensed under the BSD-style license found in the
+# LICENSE file in the root directory of this source tree.
+
 """
 README!! What's going on in this script?
 
@@ -5,14 +11,14 @@ At a high level, this script is grpo_full_finetune_distributed.py but it
 1. Uses vLLM for generation instead of torchtune generate
 2. Uses ray for orchestrating data parallel actors and vllm actors + unsharded ref actor
 3. The dataloader is now owned by the vllm worker (rather than 1 dataloader per FSDP worker)
-4. Uses a ray.util.Queue (this wraps a remote actor with a queue) as a "replay buffer" 
+4. Uses a ray.util.Queue (this wraps a remote actor with a queue) as a "replay buffer"
    for the vllm workers to put their generated tokens into, and the FSDP workers to get them from
 5. Of the items in GRPOTrajectory
         a. query_responses: vllm worker computes and puts into queue
         b. logprobs vllm worker puts into queue
         c. ref_logprobs: computed by unsharded RefActor which contains torchtune model
         d. rewards: fsdp worker computes
-        e. sucecesses: fsdp worker computes
+        e. successes: fsdp worker computes
         f. advantages: fsdp worker computes
         g. masks: fsdp worker computes
         h. position_ids: fsdp worker computes
@@ -25,7 +31,7 @@ At a high level, this script is grpo_full_finetune_distributed.py but it
 With this script, I can observe successes + rewards increasing over training steps, which is
 a good sign. (See screenshot in Cabernet sprint notes.) But there are several issues with this script:
 1. Peak memory usage for the fsdp worker is significantly higher than the original recipe in a fresh conda environmnet.
-   This could be because 
+   This could be because
     a. I turned compile off (it seems to be broken with torch 2.5.1 that vllm requires)
     b. [FIXED] I turned activation checkpointing off (there wasn't an explcit reason for this it just got omitted accidentally)
 2. I have an assert that num_vllm_workers == 1 and vllm_tp_size == 1 for now. There's no real reason for this,
@@ -41,13 +47,15 @@ The run command is
 
 """
 
+
 import functools
 import os
 import time
 from functools import partial
 from logging import log
 from re import S
-from typing import Any, Dict, List, Optional, Tuple, Union
+
+from typing import Any, Dict, List, Optional, Tuple, TypedDict, Union
 
 from warnings import warn
 
@@ -62,10 +70,14 @@ from ray.util.placement_group import placement_group
 
 from ray.util.queue import Queue
 from ray.util.scheduling_strategies import PlacementGroupSchedulingStrategy
+
+from tensordict import TensorDict
 from torch.optim import Optimizer
 
 from torchdata.stateful_dataloader import StatefulDataLoader
 from torchdata.stateful_dataloader.sampler import StatefulDistributedSampler
+
+from torchrl.data import LazyStackStorage, RayReplayBuffer
 from torchtune import config, generation, modules, rlhf, training, utils
 from torchtune.dev.grpo.types import GRPOStats, GRPOTrajectory
 from torchtune.models import qwen2_5
@@ -75,8 +87,20 @@ from torchtune.training import DummyProfiler, PROFILER_KEY
 from torchtune.training.lr_schedulers import get_lr
 
 from vllm import LLM, SamplingParams
+
 from vllm.utils import get_ip, get_open_port
 from vllm.worker.worker import Worker
+
+
+class Trajectory(TypedDict):
+    query_responses: torch.Tensor
+    responses: torch.Tensor
+    logprobs: torch.Tensor
+    ref_logprobs: torch.Tensor
+    query_response_padding_masks: torch.Tensor
+    seq_lens: torch.Tensor
+    answers: torch.Tensor
+
 
 log = utils.get_logger("DEBUG")
 
@@ -109,11 +133,11 @@ def stateless_init_process_group(
 class RefActor:
     def __init__(self, *args, **kwargs):
         assert "rollout_queue" in kwargs, "Must pass queue to vLLMRefActor"
-        assert "actor_queue" in kwargs, "Must pass queue to vLLMRefActor"
+        assert "replay_buffer" in kwargs, "Must pass replay_buffer to vLLMRefActor"
         assert "cfg" in kwargs, "Must pass cfg to vLLMRefActor"
         self.cfg = kwargs.pop("cfg")
-        self.rollout_replay_buffer = kwargs.pop("rollout_queue")
-        self.actor_replay_buffer = kwargs.pop("actor_queue")
+        self.rollout_queue = kwargs.pop("rollout_queue")
+        self.replay_buffer = kwargs.pop("replay_buffer")
         # self.llm = LLM(*args, **kwargs)
         self._device = utils.get_device(device=self.cfg.device)
         self._dtype = training.get_dtype(self.cfg.dtype, device=self._device)
@@ -178,7 +202,7 @@ class RefActor:
             trajectory = None
             while trajectory is None:
                 try:
-                    trajectory = self.rollout_replay_buffer.get(timeout=0.5)
+                    trajectory = self.rollout_queue.get(timeout=0.5)
                 except Exception:
                     trajectory = None
                     time.sleep(0.1)
@@ -191,6 +215,7 @@ class RefActor:
                 seq_lens,
                 answers,
             ) = trajectory
+            batch_size = query_responses.shape[0]
 
             context_length = query_responses.shape[1] - responses.shape[1]
 
@@ -213,17 +238,18 @@ class RefActor:
             del ref_logits, position_ids, masks
             # masking of ref_logprobs is done in grpo_step
 
-            trajectory = (
-                query_responses,
-                responses,
-                logprobs,
-                ref_logprobs,
-                query_response_padding_masks,
-                seq_lens,
-                answers,
+            trajectory = TensorDict(  # noqa
+                query_responses=query_responses,
+                responses=responses,
+                logprobs=logprobs,
+                ref_logprobs=ref_logprobs,
+                query_response_padding_masks=query_response_padding_masks,
+                seq_lens=seq_lens,
+                answers=answers,
+                batch_size=batch_size,
             )
             print("putting trajectory into actor queue")
-            self.actor_replay_buffer.put_nowait(trajectory)
+            self.replay_buffer.extend(trajectory)
             torch.cuda.empty_cache()
 
             idx += 1
@@ -1012,7 +1038,7 @@ class PyTorchActorModel:
                 while trajectory is None:
                     try:
                         print(f"{self.rank=} getting from queue")
-                        trajectory = self.replay_buffer.get(timeout=0.5)
+                        trajectory: Trajectory = self.replay_buffer.sample()
                     except Exception:
                         trajectory = None
                     time.sleep(0.1)
@@ -1041,16 +1067,15 @@ class PyTorchActorModel:
                 #     return
 
                 # print(f"{self.rank=} got trajectory, {len(trajectory)}, {trajectory[0].device}")
-                (
-                    query_responses,
-                    responses,
-                    logprobs,
-                    ref_logprobs,
-                    # response_padding_masks,
-                    query_response_padding_masks,
-                    seq_lens,
-                    answers,
-                ) = trajectory
+                query_responses = trajectory["query_responses"]
+                responses = trajectory["responses"]
+                logprobs = trajectory["logprobs"]
+                ref_logprobs = trajectory["ref_logprobs"]
+                query_response_padding_masks = trajectory[
+                    "query_response_padding_masks"
+                ]
+                seq_lens = trajectory["seq_lens"]
+                answers = trajectory["answers"]
 
                 # FIXME: move stop token tensor to __init__
                 (
@@ -1219,10 +1244,13 @@ class RayGRPORecipe:
         assert self.vllm_tp_size == 1
         # FIXME: replace with the real deal RayReplayBuffer :)
         # this has a remote actor wrapped inside so no need to rewrap
-        self.rollout_replay_buffer = Queue(
-            actor_options={"num_cpus": 10, "num_gpus": 1}
+        self.rollout_queue = Queue(actor_options={"num_cpus": 10, "num_gpus": 1})
+
+        # This is the 'real' replay buffer
+        # FIXME: hardcoded storage size + batch-size of the buffer
+        self.replay_buffer = RayReplayBuffer(
+            storage=partial(LazyStackStorage, 1000), batch_size=1
         )
-        self.actor_replay_buffer = Queue(actor_options={"num_cpus": 10, "num_gpus": 1})
         self.rollout_workers = self._create_vllm_workers()
         self.ref_worker = self._create_ref_worker()
         self.actor_workers = self._create_fsdp_group(
@@ -1248,14 +1276,14 @@ class RayGRPORecipe:
                 "MASTER_ADDR": addr,
                 "MASTER_PORT": port,
             }
-            worker = worker_cls.remote(self.cfg, env_vars, self.actor_replay_buffer)
+            worker = worker_cls.remote(self.cfg, env_vars, self.replay_buffer)
             fsdp_workers.append(worker)
         return fsdp_workers
 
     def _create_ref_worker(self):
         worker = RefActor.remote(
-            rollout_queue=self.rollout_replay_buffer,
-            actor_queue=self.actor_replay_buffer,
+            rollout_queue=self.rollout_queue,
+            replay_buffer=self.replay_buffer,
             cfg=self.cfg,
         )
         return worker
@@ -1286,7 +1314,7 @@ class RayGRPORecipe:
                     tensor_parallel_size=self.vllm_tp_size,
                     distributed_executor_backend="ray",
                     # pass some additional args to the wrapper
-                    queue=self.rollout_replay_buffer,
+                    queue=self.rollout_queue,
                     cfg=self.cfg,
                 )
             )
@@ -1343,6 +1371,9 @@ class RayGRPORecipe:
 
 @config.parse
 def recipe_main(cfg: DictConfig) -> None:
+
+    if cfg.get("enable_expandable_segments", True):
+        os.environ["PYTORCH_CUDA_ALLOC_CONF"] = "expandable_segments:True"
 
     recipe = RayGRPORecipe()
     recipe.setup(cfg)
