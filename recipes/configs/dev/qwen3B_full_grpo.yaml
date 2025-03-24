@@ -114,7 +114,7 @@ num_ref_workers: 1
 num_fsdp_workers: 2
 
 vllm:
-  num_workers: 5
+  num_workers: 4
   tp_size: 1
   batch_size: 1 # TODO: for now, needs to match recipe batch size
   queue_maxsize: 3 #num workers * steps_before_sync

@@ -85,6 +85,9 @@ from vllm import LLM, SamplingParams
 from vllm.utils import get_ip, get_open_port
 from vllm.worker.worker import Worker
 
+from torchrl.collectors.vllm_weight_update import vLLMHFLocalWeightUpdater, vLLMRemoteWeightUpdaterBase, WorkerExtension
+from torchrl.envs import LLMEnv
+
 log = utils.get_logger("DEBUG")
 
 
@@ -811,9 +814,9 @@ class PyTorchActorModel:
         world_size = torch.distributed.get_world_size()
         self.rank = int(os.environ["RANK"])
         self.world_size = int(os.environ["WORLD_SIZE"])
-        self.device_mesh = init_device_mesh(
-            "cuda", mesh_shape=(world_size,), mesh_dim_names=["fsdp"]
-        )
+        self.fsdp_group = torch.distributed.new_group(ranks=list(range(self.world_size - 1)))
+        self.device_mesh = torch.distributed.device_mesh.DeviceMesh.from_group(self.fsdp_group, device_type="cuda")
+ 
         self._is_rank_zero = self.rank == 0
 
         # Training configuration
@@ -1045,6 +1048,7 @@ class PyTorchActorModel:
             shard_conditions=fsdp_shard_conditions,
             cpu_offload=fsdp_cpu_offload,
             reshard_after_forward=True,
+            dp_mesh = self.device_mesh,
         )
 
         with training.set_default_dtype(self._dtype), self._device:
@@ -1080,7 +1084,7 @@ class PyTorchActorModel:
         disable_dropout(model)
 
         # synchronize before training begins
-        torch.distributed.barrier()
+        torch.distributed.barrier(group=self.fsdp_group)
         return model
 
     def _setup_optimizer(
@@ -1352,9 +1356,9 @@ class PyTorchActorModel:
                     )
 
                 # optimizer step
-                torch.distributed.barrier()
+                torch.distributed.barrier(group=self.fsdp_group)
                 self._optimizer.step()
-                torch.distributed.barrier()
+                torch.distributed.barrier(group=self.fsdp_group)
                 self._optimizer.zero_grad(set_to_none=True)
 
                 # scheduler
@@ -1370,7 +1374,7 @@ class PyTorchActorModel:
             time_weight_sync = time_weight_gather = 0
             if self._steps_run % self._steps_before_sync == 0:
                 utils.log_rank_zero(log, "started weight gather")
-                torch.distributed.barrier()
+                torch.distributed.barrier(group=self.fsdp_group)
                 time_weight_gather_start = time.perf_counter()
                 new_sd = {
                     k: v.full_tensor() for k, v in self._model.state_dict().items()
@@ -1425,9 +1429,13 @@ class PyTorchActorModel:
             ):
                 torch.cuda.memory._record_memory_history(enabled=None)
 
-            torch.distributed.barrier()
+            torch.distributed.barrier(group=self.fsdp_group)
 
         self._profiler.stop()
+
+    def register_parameter_server(self, parameter_server):
+        assert self._is_rank_zero
+        self.parameter_server = parameter_server
 
     def sync_weights(self, new_sd):
         """Synchronize model weights with vLLM engines."""
@@ -1456,7 +1464,12 @@ class PyTorchActorModel:
             # Wake up vLLM workers to resume rollouts
             for eng in self._vllm_engines:
                 eng.wake_up.remote()
-        torch.distributed.barrier()
+        else:
+            # Non-zero training ranks don’t participate in vLLM weight sync
+            pass
+
+        torch.distributed.barrier(group=self.fsdp_group)
+        print("waking up", flush=True)
 
     def _prepare_trajectory(self, raw_trajectory):
         """Process raw trajectory, compute rewards, and prepare for optimization.
@@ -1530,9 +1543,9 @@ class PyTorchActorModel:
         )
 
         # Reduce rewards and successes for logging
-        torch.distributed.reduce(rewards_full, dst=0, op=torch.distributed.ReduceOp.AVG)
+        torch.distributed.reduce(rewards_full, dst=0, op=torch.distributed.ReduceOp.AVG, group=self.fsdp_group)
         torch.distributed.reduce(
-            successes_full, dst=0, op=torch.distributed.ReduceOp.AVG
+            successes_full, dst=0, op=torch.distributed.ReduceOp.AVG, group=self.fsdp_group
         )
         if self._is_rank_zero:
             rewards_mean_per_func = rewards_full.mean(dim=(0, 1)).cpu()
@@ -1546,7 +1559,7 @@ class PyTorchActorModel:
 
         # Clean up intermediate variables
         del rewards_full, successes_full, responses, rewards_sum
-        torch.distributed.barrier()
+        torch.distributed.barrier(group=self.fsdp_group)
 
         # Metadata for logging
         metadata = {
@@ -1582,6 +1595,51 @@ class MetricLoggerActor:
             self.logger.close()
 
 
+@ray.remote(num_cpus=1, num_gpus=1)
+class vLLMParameterServer(vLLMRemoteWeightUpdaterBase):
+    def __init__(self, model, vllm_master_address, vllm_master_port, env_vars):
+        print("in param server init")
+        super().__init__(model, vllm_master_address, vllm_master_port)
+        
+        import os
+        import torch
+        import torch.distributed
+
+        torch.cuda.set_device(torch.device('cuda', 0))
+
+        for var in env_vars:
+            os.environ[var] = str(env_vars[var])
+
+        if not torch.distributed.is_initialized():
+            torch.distributed.init_process_group(backend="nccl", device_id=torch.device('cuda:0'))
+            print("done init process group")
+
+        self.rank = int(os.environ["RANK"])
+        self.world_size = int(os.environ["WORLD_SIZE"])
+        assert self.rank == self.world_size - 1
+        print(self.rank)
+
+        self.fsdp_group = torch.distributed.new_group(ranks=list(range(self.world_size - 1)))
+        print("done setting up parameter server")
+
+    def receive_from_trainer(self):
+        for k, v in self.state_dict.items():
+            torch.distributed.recv(v, src=0)
+
+    def _skip_update(self, worker_id: int) -> bool:
+        pass
+
+    def check_weights_changed(self):
+        """
+        Check if the weights are updated to 0.
+        """
+        weights_updated = True
+        for name, p in self.state_dict.items():
+            weights_updated = weights_updated and torch.allclose(
+                p, torch.zeros_like(p))
+        return weights_updated
+
+
 class RayGRPORecipe:
     def setup(self, cfg):
         self.cfg = cfg
@@ -1602,8 +1660,8 @@ class RayGRPORecipe:
         # Create workers using config values directly
         self.rollout_workers = self._create_vllm_workers()
         self.ref_workers = self._create_ref_workers()
-        self.actor_workers = self._create_fsdp_group(
-            worker_cls=PyTorchActorModel, fsdp_world_size=self.num_fsdp_workers
+        self.actor_workers, self.param_server = self._create_fsdp_group_and_param_server(
+            worker_cls=PyTorchActorModel, parameter_server_cls=vLLMParameterServer, fsdp_world_size=self.num_fsdp_workers, num_vllm_workers=self.num_vllm_workers
         )
         self._init_weight_sync_pg()
 
@@ -1631,13 +1689,14 @@ class RayGRPORecipe:
         for worker in self.actor_workers:
             worker.set_metric_logger.remote(self.metric_logger)
 
-    def _create_fsdp_group(self, worker_cls, fsdp_world_size: int):
+    def _create_fsdp_group_and_param_server(self, worker_cls, parameter_server_cls, fsdp_world_size: int, num_vllm_workers: int):
         addr, port = get_ip(), get_open_port()
         fsdp_workers = []
+        world_size = fsdp_world_size + 1
         for i in range(fsdp_world_size):
             env_vars = {
                 "RANK": str(i),
-                "WORLD_SIZE": fsdp_world_size,
+                "WORLD_SIZE": world_size,
                 "MASTER_ADDR": addr,
                 "MASTER_PORT": port,
             }
@@ -1647,7 +1706,23 @@ class RayGRPORecipe:
                 self.replay_buffer,
             )
             fsdp_workers.append(worker)
-        return fsdp_workers
+        
+        vllm_addresses = [get_ip()] * num_vllm_workers
+        vllm_ports = [get_open_port() for i in range(num_vllm_workers)]
+
+        env_vars = {
+            "RANK": str(fsdp_world_size),
+            "WORLD_SIZE": world_size,
+            "MASTER_ADDR": addr,
+            "MASTER_PORT": port,
+        }
+
+        # FIXME: refactor this to be a transformation on self.cfg.model
+        parameter_server = parameter_server_cls.remote("Qwen/Qwen2.5-3B", vllm_addresses, vllm_ports, env_vars)
+
+        fsdp_workers[0].register_parameter_server.remote(parameter_server)
+        
+        return fsdp_workers, parameter_server
 
     def _create_ref_worker(self):
         worker = RefActor.remote(
