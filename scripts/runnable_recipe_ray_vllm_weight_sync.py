@@ -86,7 +86,6 @@ from vllm.utils import get_ip, get_open_port
 from vllm.worker.worker import Worker
 
 from torchrl.collectors.vllm_weight_update import vLLMHFLocalWeightUpdater, vLLMRemoteWeightUpdaterBase, WorkerExtension
-from torchrl.envs import LLMEnv
 
 log = utils.get_logger("DEBUG")
 
@@ -412,6 +411,8 @@ class vLLMRolloutActor:
             collate_fn=collate_name,
         )
 
+        self.llm_env = self._setup_llm_env()
+
         # I'm using this to stop the generation until weight sync is done
         # FIXME: Should really use a lock
         self.sleeping = False
@@ -493,6 +494,17 @@ class vLLMRolloutActor:
             # we need to force the dataloader to finish the last iteration before it's actually used
             list(dataloader)
         return dataloader
+
+    def _setup_llm_env(self):
+        from torchrl.envs import LLMEnv
+        llmenv = LLMEnv.from_dataloader(
+            dataloader=self._dataloader,
+            # tokenizer=tokenizer,
+            str2str=False,
+            batch_size=(self.batch_size * self.grpo_samples,),
+            repeats=self.grpo_samples,
+        )
+        return llmenv
 
     def wake_up(self):
         self.sleeping = False
@@ -620,7 +632,10 @@ class vLLMRolloutActor:
                 seq_lens,
             ]
 
-        for idx, batch in enumerate(self._dataloader):
+        idx = 0
+        while idx <= 400:
+        # for idx, batch in enumerate(self._dataloader):
+            batch = self.llm_env.reset()
             time_step_start = time.perf_counter()
 
             print(f"batch {idx}")
@@ -722,6 +737,7 @@ class vLLMRolloutActor:
                     # full_queue_data_discard=full_queue_data_discard,
                     gpu_memory=gpu_memory,
                 )
+            idx += 1
 
 
 class vLLMWorkerWrapper(Worker):
