@@ -1597,11 +1597,7 @@ class RayGRPORecipe:
             actor_options={"num_cpus": 10, "num_gpus": 0},
             maxsize=cfg.vllm.queue_maxsize,
         )
-        self.replay_buffer = RayReplayBuffer(
-            storage=functools.partial(LazyStackStorage, max_size=3),
-            batch_size=1,
-            remote_config={"num_cpus": 10, "num_gpus": 0},
-        )
+        self.replay_buffer = RayReplayBuffer(storage=functools.partial(LazyStackStorage, max_size=self.cfg.vllm.queue_maxsize), batch_size=1, remote_config={"num_cpus": 10, "num_gpus": 0})
 
         # Create workers using config values directly
         self.rollout_workers = self._create_vllm_workers()
