@@ -119,6 +119,19 @@ vllm:
   batch_size: 1 # TODO: for now, needs to match recipe batch size
   queue_maxsize: 3 #num workers * steps_before_sync
 
+total_resources:
+  num_cpus: 512
+  num_gpus: 8
+
+buffer:
+  size: 1000
+
+actor:
+  resources:
+      num_cpus: 16
+      num_gpus: 1
+  buffer_size: 1000
+  batch_size: 1
 
 # Logging
 metric_logger:
