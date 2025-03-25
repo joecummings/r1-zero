@@ -70,7 +70,9 @@ from torch.optim import Optimizer
 from torchdata.stateful_dataloader import StatefulDataLoader
 from torchdata.stateful_dataloader.sampler import StatefulDistributedSampler
 from torchrl.data import LazyStackStorage, RayReplayBuffer
+
 from torchtune import config, generation, modules, rlhf, training, utils
+from torchtune.dev.grpo.rewards import batched_rewards
 from torchtune.dev.grpo.types import GRPOStats, GRPOTrajectory
 from torchtune.models import qwen2_5
 from torchtune.models.qwen2._convert_weights import qwen2_tune_to_hf
@@ -161,7 +163,7 @@ class RefActor:
     def set_metric_logger(self, logger):
         """Store the MetricLoggerActor handle."""
         if self._is_actor_zero:
-            log.info(f"setting metric logger {logger} for actor id", self.actor_id)
+            log.info(f"setting metric logger {logger} for actor id {self.actor_id}")
             self._metric_logger = logger
 
     def load_ref_checkpoint(self, cfg_ref_checkpointer: DictConfig) -> Dict[str, Any]:
@@ -210,7 +212,7 @@ class RefActor:
         time_model_running,
         time_waiting_buffer,
         # full_queue_data_discard,
-        # rollout_queue_length,
+        rollout_queue_length,
     ):
         """Log metrics for the RefActor, only on actor zero."""
         if not self._is_actor_zero:
@@ -245,7 +247,7 @@ class RefActor:
                 "ref_actor_performance/time_waiting_buffer (s)": time_waiting_buffer,
                 "ref_actor_performance/pct_time_waiting_buffer (%)": pct_time_waiting_buffer,
                 # "queues/ref_actor_full_queue_data_discard": full_queue_data_discard,
-                # "queues/rollout_queue_length": rollout_queue_length,
+                "queues/rollout_queue_length": rollout_queue_length,
             }
         )
 
@@ -271,7 +273,7 @@ class RefActor:
                 try:
                     if self._is_actor_zero:
                         log.info(f"Getting from rollout_queue queue.")
-                    trajectory = self.rollout_queue.get(timeout=0.5)
+                    trajectory = self.rollout_queue.get(timeout=1.0)
 
                     # Move tensors back to GPU
                     trajectory = [
@@ -361,7 +363,7 @@ class RefActor:
                     time_waiting_buffer=time_waiting_buffer,
                     # TODO: what should we do with this? We can log the total number of elements written in the buffer instead
                     # full_queue_data_discard=full_queue_data_discard,
-                    # rollout_queue_length=rollout_queue_length,
+                    rollout_queue_length=rollout_queue_length,
                 )
 
             torch.cuda.empty_cache()
@@ -423,7 +425,9 @@ class vLLMRolloutActor:
 
     def set_metric_logger(self, logger):
         """Store the MetricLoggerActor handle."""
-        self._metric_logger = logger
+        if self._is_actor_zero:
+            log.info(f"Setting metric logger {logger} for rank {self.actor_id}")
+            self._metric_logger = logger
 
     def start_weight_update(self, param_list, policy_version):
         # Update the policy version when weights are synchronized
@@ -496,13 +500,13 @@ class vLLMRolloutActor:
 
     def wake_up(self):
         self.sleeping = False
-        log.info(f"{self.__class__.__name__} (pid={os.getpid()}) woke up", flush=True)
+        log.info(f"{self.__class__.__name__} (pid={os.getpid()}) woke up")
 
     def is_sleeping(self):
         return self.sleeping
 
     def print_me(self, string):
-        log.info(string, flush=True)
+        log.info(string)
 
     def _log_metrics(
         self,
@@ -886,13 +890,20 @@ class PyTorchActorModel:
         if self._compile:
             training.compile_loss(self._loss_fn, verbose=self._is_rank_zero)
 
+        # TODO: generalize this to any chunked loss
+        # set num_output_chunks for model
         if self._loss_fn.__class__.__name__ == "GRPOWithChunkedOutputLoss":
             self._model.set_num_output_chunks(self._loss_fn.num_output_chunks)
 
         self._tokenizer = config.instantiate(self.cfg.tokenizer)
-        self._lr_scheduler = (
-            None  # FIXME: Requires _steps_per_epoch, not defined in GRPO
-        )
+
+        # FIXME: need to get _steps_per_epoch when dataloader is no longer per fsdp worker but instead wrapped in vLLM
+        # self._lr_scheduler = self._setup_lr_scheduler(
+        #     cfg_lr_scheduler=cfg.get("lr_scheduler", None),
+        #     num_training_steps=self.total_epochs * self._steps_per_epoch,
+        #     last_epoch=self.global_step - 1,
+        # )
+        self._lr_scheduler = None
 
         # Set up profiler, returns DummyProfiler (nullcontext object with no-op `step` method)
         # if cfg is missing profiler key or if `cfg.profiler.enabled = False`
@@ -1101,7 +1112,7 @@ class PyTorchActorModel:
         # apply to targets
         targets = trajectory.query_responses
         bsz, seq_len = targets.shape
-        targets = targets[output_mask].reshape(bsz, seq_len)
+        targets = targets[output_mask].reshape(bsz, -1)
 
         # call model
         with self.activations_handling_ctx:
@@ -1382,9 +1393,6 @@ class PyTorchActorModel:
 
     def train(self):
         """Execute the GRPO training loop."""
-        from torchtune import generation
-        from torchtune.dev.grpo.rewards import batched_rewards
-
         training.cleanup_before_training()
         self._optimizer.zero_grad()
         self._profiler.start()
