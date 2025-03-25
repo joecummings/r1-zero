@@ -322,8 +322,11 @@ class RefActor:
                 ref_logits, responses, self._temperature
             )
 
-            del ref_logits, position_ids, masks
-            # masking of ref_logprobs is done in grpo_step
+            del (
+                ref_logits,
+                position_ids,
+                masks,
+            )  # masking of ref_logprobs is done in grpo_step
 
             # Repack trajectory with policy_version
             batch_size = logprobs.shape[:1] if logprobs.ndim > 1 else ()
@@ -1083,24 +1086,18 @@ class PyTorchActorModel:
         utils.log_rank_zero(log, "Optimizer is initialized.")
         return optimizer
 
-    def grpo_step(self, trajectory: GRPOTrajectory, context_length: int) -> GRPOStats:
+    def grpo_step(
+        self, trajectory: GRPOTrajectory, output_mask: torch.Tensor
+    ) -> GRPOStats:
         """Perform a single GRPO optimization step over a batch of trajectories and corresponding advantages and returns.
 
         Args:
             trajectory (Trajectory): a batch of trajectories
-            context_length (int): input ids sequence length
+            output_mask (torch.Tensor): a boolean mask indicating which tokens in the trajectory are output tokens
 
         Returns:
             GRPOStats: An instance of :class:`~torchtune.rlhf.PPOStats`
         """
-        torch.cuda.empty_cache()
-
-        # Create an output mask to avoid computing model.output on tokens we won't train
-        output_mask = torch.zeros_like(
-            trajectory.query_responses, dtype=torch.bool, device=self._device
-        )
-        output_mask[:, context_length - 1 : -1] = True
-
         # apply to targets
         targets = trajectory.query_responses
         bsz, seq_len = targets.shape
@@ -1280,7 +1277,7 @@ class PyTorchActorModel:
 
         Returns:
             trajectory (GRPOTrajectory): Processed trajectory for GRPO optimization.
-            context_length (int): The length of the context in the query responses.
+            output_mask (torch.Tensor): Boolean mask indicating which tokens in the trajectory are output tokens.
             metadata (dict): Metadata for logging, including rewards and performance metrics.
         """
         # Extract components from raw trajectory
@@ -1374,7 +1371,14 @@ class PyTorchActorModel:
             "reward_metadata": reward_metadata,
         }
 
-        return trajectory, context_length, metadata
+        # Create an output mask to avoid computing model.output on tokens we won't train
+        # FIXME: when bsz>1, don't we have multiple context_length?
+        output_mask = torch.zeros_like(
+            trajectory.query_responses, dtype=torch.bool, device=self._device
+        )
+        output_mask[:, context_length - 1 : -1] = True
+
+        return trajectory, output_mask, metadata
 
     def train(self):
         """Execute the GRPO training loop."""
@@ -1386,6 +1390,16 @@ class PyTorchActorModel:
         self._profiler.start()
 
         while self._steps_run < self._total_steps:
+
+            # Memory profiling start
+            if (
+                self._is_rank_zero
+                and self.profiler_profile_memory
+                and self._steps_run
+                == self.profiler_wait_steps + self.profiler_warmup_steps
+            ):
+                torch.cuda.memory._record_memory_history()
+
             time_step_start = time.perf_counter()
 
             # Fetch trajectory from queue
@@ -1404,40 +1418,40 @@ class PyTorchActorModel:
             time_waiting_buffer = time.perf_counter() - time_waiting_buffer_start
             log.info(f"{self.rank=} got from queue traj {trajectory}")
 
-            # Memory profiling start
-            if (
-                self._is_rank_zero
-                and self.profiler_profile_memory
-                and self._steps_run
-                == self.profiler_wait_steps + self.profiler_warmup_steps
-            ):
-                torch.cuda.memory._record_memory_history()
-
             # Prepare trajectory for optimization
-            trajectory, context_length, metadata = self._prepare_trajectory(trajectory)
+            trajectory, output_mask, metadata = self._prepare_trajectory(trajectory)
 
             # Perform GRPO optimization
             time_grpo_steps_start = time.perf_counter()
             grpo_stats: list[GRPOStats] = []
             for _ in range(self._ppo_epochs):
-                step_stats = self.grpo_step(trajectory, context_length)
+
+                # step
+                step_stats = self.grpo_step(trajectory, output_mask)
                 grpo_stats.append(step_stats)
+
+                # grad norm
                 if self._clip_grad_norm is not None:
                     grad_norm = torch.nn.utils.clip_grad_norm_(
                         self._model.parameters(), max_norm=float(self._clip_grad_norm)
                     )
+
+                # optimizer step
                 torch.distributed.barrier()
                 self._optimizer.step()
                 torch.distributed.barrier()
                 self._optimizer.zero_grad(set_to_none=True)
+
+                # scheduler
                 self.global_step += 1
                 if self._lr_scheduler is not None:
                     self._lr_scheduler.step()
+
             log.info(f"{self.rank=} finished step {self._steps_run}")
             time_grpo_steps = time.perf_counter() - time_grpo_steps_start
             self._steps_run += 1
 
-            # Synchronize weights if needed
+            # Synchronize weights
             time_weight_sync = time_weight_gather = 0
             if self._steps_run % self._steps_before_sync == 0:
                 utils.log_rank_zero(log, "started weight gather")
@@ -1455,19 +1469,6 @@ class PyTorchActorModel:
                 del new_sd
                 time_weight_sync = time.perf_counter() - time_sync_start
                 utils.log_rank_zero(log, f"Done sync in {time_weight_sync}")
-
-            self._profiler.step()
-
-            # Memory profiling stop
-            if (
-                self._is_rank_zero
-                and self.profiler_profile_memory
-                and self._steps_run
-                == self.profiler_wait_steps
-                + self.profiler_warmup_steps
-                + self.profiler_active_steps
-            ):
-                torch.cuda.memory._record_memory_history(enabled=None)
 
             # Log metrics
             total_step_time = time.perf_counter() - time_step_start
@@ -1496,6 +1497,19 @@ class PyTorchActorModel:
                 log.info("done logging metrics")
 
             self.cleanup_after_step(trajectory, grpo_stats)
+
+            # Memory profiling stop
+            self._profiler.step()
+            if (
+                self._is_rank_zero
+                and self.profiler_profile_memory
+                and self._steps_run
+                == self.profiler_wait_steps
+                + self.profiler_warmup_steps
+                + self.profiler_active_steps
+            ):
+                torch.cuda.memory._record_memory_history(enabled=None)
+
             torch.distributed.barrier()
 
         self._profiler.stop()
