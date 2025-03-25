@@ -1291,110 +1291,6 @@ class PyTorchActorModel:
 
         ray.get(self._metric_logger.log_dict.remote(log_dict, step=step_idx))
 
-    def _prepare_trajectory(self, raw_trajectory):
-        """Process raw trajectory, compute rewards, and prepare for optimization.
-
-        Args:
-            raw_trajectory: The trajectory sampled from the replay buffer.
-
-        Returns:
-            trajectory (GRPOTrajectory): Processed trajectory for GRPO optimization.
-            context_length (int): Length of the context sequence.
-            metadata (dict): Metadata for logging, including rewards and performance metrics.
-        """
-        # Extract components from raw trajectory
-        query_responses = raw_trajectory.query_responses
-        responses = raw_trajectory.responses
-        logprobs = raw_trajectory.logprobs
-        ref_logprobs = raw_trajectory.ref_logprobs
-        query_response_padding_masks = raw_trajectory.query_response_padding_masks
-        seq_lens = raw_trajectory.seq_lens
-        answers = raw_trajectory.answers
-        policy_version = raw_trajectory.policy_version
-
-        # Compute padded tokens percentage
-        total_tokens = query_responses.numel()
-        padded_tokens = (query_responses == self._tokenizer.pad_id).sum().item()
-        padded_tokens_percentage = (
-            (padded_tokens / total_tokens) * 100 if total_tokens > 0 else 0
-        )
-        number_of_tokens = seq_lens.sum().item()
-
-        # Truncate sequences at first stop token
-        response_padding_masks, responses = rlhf.truncate_sequence_at_first_stop_token(
-            responses,
-            torch.tensor(self._tokenizer.stop_tokens, device=self._device),
-            self._tokenizer.pad_id,
-        )
-
-        # Generate masks and position IDs
-        masks = generation.get_causal_mask_from_padding_mask(
-            query_response_padding_masks
-        )
-        position_ids = generation.get_position_ids_from_padding_mask(
-            query_response_padding_masks
-        )
-        context_length = query_responses.shape[1] - responses.shape[1]
-        del query_response_padding_masks
-
-        # Compute rewards
-        responses = responses.reshape(self.batch_size, self.grpo_samples, -1)
-        rewards_full, successes_full, reward_metadata = batched_rewards(
-            self._tokenizer, responses, answers, device=self._device
-        )
-
-        # Compute advantages: B, G, num_funcs -> B, G
-        rewards_sum = rewards_full.sum(-1)
-        advantages = (rewards_sum - rewards_sum.mean(1, keepdim=True)) / (
-            rewards_sum.std(1, keepdim=True) + 1e-4
-        )
-        advantages = advantages.reshape(self.batch_size * self.grpo_samples)
-
-        # Create GRPOTrajectory
-        trajectory = GRPOTrajectory(
-            query_responses=query_responses,
-            logprobs=logprobs,
-            ref_logprobs=ref_logprobs,
-            advantages=advantages,
-            masks=masks,
-            position_ids=position_ids,
-            response_padding_masks=response_padding_masks,
-            seq_lens=training.get_unmasked_sequence_lengths(response_padding_masks),
-        )
-
-        # Reduce rewards and successes for logging
-        torch.distributed.reduce(rewards_full, dst=0, op=torch.distributed.ReduceOp.AVG)
-        torch.distributed.reduce(
-            successes_full, dst=0, op=torch.distributed.ReduceOp.AVG
-        )
-        if self._is_rank_zero:
-            rewards_mean_per_func = rewards_full.mean(dim=(0, 1)).cpu()
-            successes_mean_per_func = successes_full.mean(dim=(0, 1)).cpu()
-            rewards_mean = rewards_mean_per_func.mean()
-            successes_mean = successes_mean_per_func.mean()
-        else:
-            rewards_mean_per_func = successes_mean_per_func = rewards_mean = (
-                successes_mean
-            ) = None
-
-        # Clean up intermediate variables
-        del rewards_full, successes_full, responses, rewards_sum
-        torch.distributed.barrier()
-
-        # Metadata for logging
-        metadata = {
-            "padded_tokens_percentage": padded_tokens_percentage,
-            "number_of_tokens": number_of_tokens,
-            "policy_version": policy_version,
-            "rewards_mean": rewards_mean,
-            "successes_mean": successes_mean,
-            "rewards_mean_per_func": rewards_mean_per_func,
-            "successes_mean_per_func": successes_mean_per_func,
-            "reward_metadata": reward_metadata,
-        }
-
-        return trajectory, context_length, metadata
-
     def train(self):
         """Execute the GRPO training loop."""
         training.cleanup_before_training()
@@ -1557,6 +1453,110 @@ class PyTorchActorModel:
             for eng in self._vllm_engines:
                 eng.wake_up.remote()
         torch.distributed.barrier()
+
+    def _prepare_trajectory(self, raw_trajectory):
+        """Process raw trajectory, compute rewards, and prepare for optimization.
+
+        Args:
+            raw_trajectory: The trajectory sampled from the replay buffer.
+
+        Returns:
+            trajectory (GRPOTrajectory): Processed trajectory for GRPO optimization.
+            context_length (int): Length of the context sequence.
+            metadata (dict): Metadata for logging, including rewards and performance metrics.
+        """
+        # Extract components from raw trajectory
+        query_responses = raw_trajectory.query_responses
+        responses = raw_trajectory.responses
+        logprobs = raw_trajectory.logprobs
+        ref_logprobs = raw_trajectory.ref_logprobs
+        query_response_padding_masks = raw_trajectory.query_response_padding_masks
+        seq_lens = raw_trajectory.seq_lens
+        answers = raw_trajectory.answers
+        policy_version = raw_trajectory.policy_version
+
+        # Compute padded tokens percentage
+        total_tokens = query_responses.numel()
+        padded_tokens = (query_responses == self._tokenizer.pad_id).sum().item()
+        padded_tokens_percentage = (
+            (padded_tokens / total_tokens) * 100 if total_tokens > 0 else 0
+        )
+        number_of_tokens = seq_lens.sum().item()
+
+        # Truncate sequences at first stop token
+        response_padding_masks, responses = rlhf.truncate_sequence_at_first_stop_token(
+            responses,
+            torch.tensor(self._tokenizer.stop_tokens, device=self._device),
+            self._tokenizer.pad_id,
+        )
+
+        # Generate masks and position IDs
+        masks = generation.get_causal_mask_from_padding_mask(
+            query_response_padding_masks
+        )
+        position_ids = generation.get_position_ids_from_padding_mask(
+            query_response_padding_masks
+        )
+        context_length = query_responses.shape[1] - responses.shape[1]
+        del query_response_padding_masks
+
+        # Compute rewards
+        responses = responses.reshape(self.batch_size, self.grpo_samples, -1)
+        rewards_full, successes_full, reward_metadata = batched_rewards(
+            self._tokenizer, responses, answers, device=self._device
+        )
+
+        # Compute advantages: B, G, num_funcs -> B, G
+        rewards_sum = rewards_full.sum(-1)
+        advantages = (rewards_sum - rewards_sum.mean(1, keepdim=True)) / (
+            rewards_sum.std(1, keepdim=True) + 1e-4
+        )
+        advantages = advantages.reshape(self.batch_size * self.grpo_samples)
+
+        # Create GRPOTrajectory
+        trajectory = GRPOTrajectory(
+            query_responses=query_responses,
+            logprobs=logprobs,
+            ref_logprobs=ref_logprobs,
+            advantages=advantages,
+            masks=masks,
+            position_ids=position_ids,
+            response_padding_masks=response_padding_masks,
+            seq_lens=training.get_unmasked_sequence_lengths(response_padding_masks),
+        )
+
+        # Reduce rewards and successes for logging
+        torch.distributed.reduce(rewards_full, dst=0, op=torch.distributed.ReduceOp.AVG)
+        torch.distributed.reduce(
+            successes_full, dst=0, op=torch.distributed.ReduceOp.AVG
+        )
+        if self._is_rank_zero:
+            rewards_mean_per_func = rewards_full.mean(dim=(0, 1)).cpu()
+            successes_mean_per_func = successes_full.mean(dim=(0, 1)).cpu()
+            rewards_mean = rewards_mean_per_func.mean()
+            successes_mean = successes_mean_per_func.mean()
+        else:
+            rewards_mean_per_func = successes_mean_per_func = rewards_mean = (
+                successes_mean
+            ) = None
+
+        # Clean up intermediate variables
+        del rewards_full, successes_full, responses, rewards_sum
+        torch.distributed.barrier()
+
+        # Metadata for logging
+        metadata = {
+            "padded_tokens_percentage": padded_tokens_percentage,
+            "number_of_tokens": number_of_tokens,
+            "policy_version": policy_version,
+            "rewards_mean": rewards_mean,
+            "successes_mean": successes_mean,
+            "rewards_mean_per_func": rewards_mean_per_func,
+            "successes_mean_per_func": successes_mean_per_func,
+            "reward_metadata": reward_metadata,
+        }
+
+        return trajectory, context_length, metadata
 
     def cleanup(self) -> None:
         """Close the metric logger on rank zero."""
