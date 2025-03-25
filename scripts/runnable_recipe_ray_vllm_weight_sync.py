@@ -212,7 +212,7 @@ class RefActor:
         time_model_running,
         time_waiting_buffer,
         # full_queue_data_discard,
-        rollout_queue_length,
+        rollout_queue_size,
     ):
         """Log metrics for the RefActor, only on actor zero."""
         if not self._is_actor_zero:
@@ -247,7 +247,7 @@ class RefActor:
                 "ref_actor_performance/time_waiting_buffer (s)": time_waiting_buffer,
                 "ref_actor_performance/pct_time_waiting_buffer (%)": pct_time_waiting_buffer,
                 # "queues/ref_actor_full_queue_data_discard": full_queue_data_discard,
-                "queues/rollout_queue_length": rollout_queue_length,
+                "queues/rollout_queue_size": rollout_queue_size,
             }
         )
 
@@ -268,7 +268,7 @@ class RefActor:
             time_step_start = time.perf_counter()
             trajectory = None
             if self._is_actor_zero:
-                rollout_queue_length = self.rollout_queue.qsize()
+                rollout_queue_size = self.rollout_queue.qsize()
             while trajectory is None:
                 try:
                     if self._is_actor_zero:
@@ -363,7 +363,7 @@ class RefActor:
                     time_waiting_buffer=time_waiting_buffer,
                     # TODO: what should we do with this? We can log the total number of elements written in the buffer instead
                     # full_queue_data_discard=full_queue_data_discard,
-                    rollout_queue_length=rollout_queue_length,
+                    rollout_queue_size=rollout_queue_size,
                 )
 
             torch.cuda.empty_cache()
@@ -1098,21 +1098,29 @@ class PyTorchActorModel:
         return optimizer
 
     def grpo_step(
-        self, trajectory: GRPOTrajectory, output_mask: torch.Tensor
+        self,
+        trajectory: GRPOTrajectory,
+        context_length: int,
     ) -> GRPOStats:
         """Perform a single GRPO optimization step over a batch of trajectories and corresponding advantages and returns.
 
         Args:
             trajectory (Trajectory): a batch of trajectories
-            output_mask (torch.Tensor): a boolean mask indicating which tokens in the trajectory are output tokens
+            context_length (int): the length of the context window
+            targets_mask (torch.Tensor): a boolean mask indicating which tokens in the trajectory are targets
 
         Returns:
             GRPOStats: An instance of :class:`~torchtune.rlhf.PPOStats`
         """
-        # apply to targets
-        targets = trajectory.query_responses
-        bsz, seq_len = targets.shape
-        targets = targets[output_mask].reshape(bsz, -1)
+
+        # Create an output mask to avoid computing model.output on tokens we won't train
+        # FIXME: when bsz>1, don't we have multiple context_length?
+        # FIXME: because of chunked CE, the outout of pi_logits is a chunked list, so masking after the fact is
+        # more annoying. Masking before the chunking is easier, but we have to figure out masking for bsz>1
+        output_mask = torch.zeros_like(
+            trajectory.query_responses, dtype=torch.bool, device=self._device
+        )
+        output_mask[:, context_length - 1 : -1] = True
 
         # call model
         with self.activations_handling_ctx:
@@ -1122,6 +1130,9 @@ class PyTorchActorModel:
                 mask=trajectory.masks,
                 output_mask=output_mask,
             )
+
+        # apply to targets
+        targets = trajectory.query_responses[:, context_length:]
 
         # Compute GRPO loss
         loss, policy_loss, kl_loss, ratios, clipfrac, pi_logprobs = self._loss_fn(
@@ -1288,7 +1299,7 @@ class PyTorchActorModel:
 
         Returns:
             trajectory (GRPOTrajectory): Processed trajectory for GRPO optimization.
-            output_mask (torch.Tensor): Boolean mask indicating which tokens in the trajectory are output tokens.
+            context_length (int): Length of the context sequence.
             metadata (dict): Metadata for logging, including rewards and performance metrics.
         """
         # Extract components from raw trajectory
@@ -1382,14 +1393,7 @@ class PyTorchActorModel:
             "reward_metadata": reward_metadata,
         }
 
-        # Create an output mask to avoid computing model.output on tokens we won't train
-        # FIXME: when bsz>1, don't we have multiple context_length?
-        output_mask = torch.zeros_like(
-            trajectory.query_responses, dtype=torch.bool, device=self._device
-        )
-        output_mask[:, context_length - 1 : -1] = True
-
-        return trajectory, output_mask, metadata
+        return trajectory, context_length, metadata
 
     def train(self):
         """Execute the GRPO training loop."""
@@ -1427,7 +1431,7 @@ class PyTorchActorModel:
             log.info(f"{self.rank=} got from queue traj {trajectory}")
 
             # Prepare trajectory for optimization
-            trajectory, output_mask, metadata = self._prepare_trajectory(trajectory)
+            trajectory, context_length, metadata = self._prepare_trajectory(trajectory)
 
             # Perform GRPO optimization
             time_grpo_steps_start = time.perf_counter()
@@ -1435,7 +1439,10 @@ class PyTorchActorModel:
             for _ in range(self._ppo_epochs):
 
                 # step
-                step_stats = self.grpo_step(trajectory, output_mask)
+                step_stats = self.grpo_step(
+                    trajectory,
+                    context_length,
+                )
                 grpo_stats.append(step_stats)
 
                 # grad norm
@@ -1587,7 +1594,7 @@ class RayGRPORecipe:
             maxsize=cfg.vllm.queue_maxsize,
         )
         self.replay_buffer = RayReplayBuffer(
-            storage=functools.partial(LazyStackStorage, max_size=1000),
+            storage=functools.partial(LazyStackStorage, max_size=3),
             batch_size=1,
             remote_config={"num_cpus": 10, "num_gpus": 0},
         )
