@@ -38,11 +38,11 @@ The run command is
 
     python runnable_recipe_ray_vllm_weight_sync.py --config ../recipes/configs/dev/qwen3B_full_grpo.yaml
 
-
 """
 
 import functools
 import os
+import sys
 import time
 from functools import partial
 from logging import log
@@ -62,10 +62,12 @@ from ray.util.placement_group import placement_group
 
 from ray.util.queue import Full as QueueFull, Queue
 from ray.util.scheduling_strategies import PlacementGroupSchedulingStrategy
+from tensordict import is_tensorclass, TensorClass
 from torch.optim import Optimizer
 
 from torchdata.stateful_dataloader import StatefulDataLoader
 from torchdata.stateful_dataloader.sampler import StatefulDistributedSampler
+from torchrl.data import LazyStackStorage, RayReplayBuffer
 from torchtune import config, generation, modules, rlhf, training, utils
 from torchtune.dev.grpo.types import GRPOStats, GRPOTrajectory
 from torchtune.models import qwen2_5
@@ -105,7 +107,7 @@ def stateless_init_process_group(
     return pynccl
 
 
-@ray.remote(num_cpus=8, num_gpus=1)
+@ray.remote(num_cpus=16, num_gpus=1)
 class RefActor:
     def __init__(self, *args, **kwargs):
         assert "rollout_queue" in kwargs, "Must pass queue to vLLMRefActor"
@@ -717,8 +719,6 @@ class vLLMWorkerWrapper(Worker):
     """vLLM Rollout Model worker for Ray."""
 
     def __init__(self, *args, **kwargs):
-        import os
-
         print(f"visible devices {os.environ['CUDA_VISIBLE_DEVICES']}")
         print(f"device count {torch.cuda.device_count()}")
         super().__init__(*args, **kwargs)
@@ -749,83 +749,50 @@ class vLLMWorkerWrapper(Worker):
         del weight
 
 
-@ray.remote(num_cpus=8, num_gpus=1)
-class PyTorchActorModel:
+@ray.remote
+class RayTrainer:
     def __init__(
         self,
         cfg,
         environment_variables,
         replay_buffer,
     ):
-        import torch
-
-        # shared queue to get trajectories + logprobs from vllm
-        self.replay_buffer = replay_buffer
-
-        self.cfg = cfg
-
-        self._device = utils.get_device(device=cfg.device)
-        self._dtype = training.get_dtype(cfg.dtype, device=self._device)
-
+        self.device = utils.get_device(device=cfg.device)
+        self.dtype = training.get_dtype(cfg.dtype, device=self.device)
         device_type = self.cfg.device
-        self._log_peak_memory_stats = self.cfg.get("log_peak_memory_stats", True)
-        if self._log_peak_memory_stats and device_type != "cuda":
-            log.info(
-                "log_peak_memory_stats was set to True, however, training does not use cuda. Setting log_peak_memory_stats=False."
-            )
-            self._log_peak_memory_stats = False
 
-        if self._dtype == torch.float16:
-            raise ValueError(
-                "full fp16 training is not supported with this recipe. Please use bf16 or fp32 instead."
-            )
-
-        # logging attributes
-        self._output_dir = cfg.output_dir
-        self._log_every_n_steps = cfg.get("log_every_n_steps", 1)
-        self._log_peak_memory_stats = cfg.get("log_peak_memory_stats", False)
-
-        # if self._log_peak_memory_stats and self._device.type != "cuda":
-        #     log.info(
-        #         "log_peak_memory_stats was set to True, however, training does not use cuda. Setting log_peak_memory_stats=False."
-        #     )
-        #     self._log_peak_memory_stats = False
-
+        # Set up the backend for distributed traiing (NCCL, GLOO, etc.)
         self.fsdp_cpu_offload = cfg.get("fsdp_cpu_offload", False)
-
         self.distributed_backend = training.get_distributed_backend(
             device_type, offload_ops_to_cpu=self.fsdp_cpu_offload
         )
-
-        # ============= [START] This bit replaces init_process_group =============
-        # === Simulate torchrun to set env vars ===
-        import os
-
+        # Set proper environment variables (usually done automatically
+        # when launched w/ torchrun)
         for var in environment_variables:
             os.environ[var] = str(environment_variables[var])
-        # =========================================
+        init_process_group(distributed_backend)
 
-        import torch.distributed
-
-        if not torch.distributed.is_initialized():
-            torch.distributed.init_process_group(backend="nccl")
-
-        world_size = torch.distributed.get_world_size()
-        from torch.distributed.device_mesh import init_device_mesh
-
-        self.rank = int(os.environ["RANK"])
+        # Initialize distributed variables
         self.world_size = int(os.environ["WORLD_SIZE"])
-
-        self.device_mesh = init_device_mesh(
-            "cuda", mesh_shape=(world_size,), mesh_dim_names=["fsdp"]
+        self.rank = int(os.environ["RANK"])
+        self.tensor_parallel_plan = config.instantiate(
+            cfg.get("tensor_parallel_plan", None)
         )
-        print(self.device_mesh)
-        # ============= [END] This bit replaces init_process_group =============
+        self.tensor_parallel_dim = cfg.get("tensor_parallel_dim", 1)
+        if self.tensor_parallel_dim > 1 and self.tensor_parallel_plan is None:
+            raise ValueError(
+                "Tensor Parallel plan needs to be provided when tensor parallel is enabled."
+            )
+        if self.world_size % self.tensor_parallel_dim != 0:
+            raise ValueError(
+                f"world_size {self.world_size} must be divisible by tensor_parallel_dim {self.tensor_parallel_dim}"
+            )
+        self.data_parallel_dim = self.world_size // self.tensor_parallel_dim
 
-        world_size, rank = utils.get_world_size_and_rank()
-        self.rank = rank
-        self.world_size = world_size
-        self._is_rank_zero = rank == 0
+        # # logging attributes
+        # self._output_dir = cfg.output_dir
+        # self._log_every_n_steps = cfg.get("log_every_n_steps", 1)
+        # self._log_peak_memory_stats = cfg.get("log_peak_memory_stats", False)
 
         # Training cfg
         self._resume_from_checkpoint = cfg.resume_from_checkpoint
@@ -835,7 +802,6 @@ class PyTorchActorModel:
         self._enable_activation_checkpointing = cfg.get(
             "enable_activation_checkpointing", False
         )
-
         self._enable_activation_offloading = cfg.get(
             "enable_activation_offloading", False
         )
@@ -865,8 +831,6 @@ class PyTorchActorModel:
         self._steps_run = 0
         self._total_steps = 0
         self._epochs_run = 0
-        # This was only used for generate, so I don't think I need it?
-        self._rng = torch.Generator(self._device).manual_seed(self.seed)
 
         # RL params
         self.grpo_samples = cfg.grpo_samples
@@ -922,15 +886,7 @@ class PyTorchActorModel:
 
         # Initialize policy version for tracking age of trajectories
         self.policy_version = 0
-        self.metric_logger = None  # Placeholder for the logger
-
-        print("done setup")
-
-    def set_metric_logger(self, logger):
-        """Store the MetricLoggerActor handle."""
-        if self._is_rank_zero:
-            print("setting metric logger {logger} for rank", self.rank)
-            self._metric_logger = logger
+        self.metric_logger = None
 
     def _setup_profiler(
         self, cfg_profiler: Optional[DictConfig] = None
@@ -1042,7 +998,6 @@ class PyTorchActorModel:
         enable_activation_offloading: bool,
         fsdp_cpu_offload: bool,
         model_state_dict: Dict[str, Any],
-        # ref_model_state_dict: Dict[str, Any],
         custom_sharded_layers: Optional[List[str]] = None,
     ) -> nn.Module:
         """
@@ -1052,62 +1007,56 @@ class PyTorchActorModel:
            b. All ranks calls ``load_state_dict`` without peaking CPU RAMs since
               full state dicts are loaded with ``torch.load(mmap=True)``
         """
-        from torchtune.training import disable_dropout
-
-        # utils.log_rank_zero(
-        #     log,
-        #     "FSDP is enabled. Instantiating model and loading checkpoint on Rank 0 ...",
-        # )
-        # init_start = time.perf_counter()
-
         with training.set_default_dtype(self._dtype), torch.device("meta"):
             model = config.instantiate(cfg_model)
-            # ref_model = config.instantiate(cfg_model)
-
-        # ref_model.eval()
-        # for p in ref_model.parameters():
-        #     p.requires_grad = False
 
         if self._compile:
             training.compile_model(model, verbose=self._is_rank_zero)
-            # training.compile_model(ref_model, verbose=self._is_rank_zero)
+
+        device_mesh = init_device_mesh(
+            self._device.type,
+            mesh_shape=(self.data_parallel_dim, self.tensor_parallel_dim),
+            mesh_dim_names=("dp", "tp"),
+        )
+        self.dp_size = device_mesh["dp"].size()
+        self.dp_rank = device_mesh["dp"].get_local_rank()
+
+        # Apply tensor parallelism to the model
+        if self.tensor_parallel_dim > 1:
+            # Use the local number (num_heads, num_kv_heads, embed_dim) to account for tensor parallel
+            model = training.prepare_mha_for_tp(model, device_mesh["tp"])
+            parallelize_module(
+                model,
+                device_mesh["tp"],
+                parallelize_plan=self.tensor_parallel_plan,
+            )
 
         if enable_activation_checkpointing:
             training.set_activation_checkpointing(
                 model, auto_wrap_policy={modules.TransformerSelfAttentionLayer}
             )
 
-        # For FSDP sharding
-        fsdp_shard_conditions = [
-            partial(
-                training.get_shard_conditions,
-                names_to_match=custom_sharded_layers,
+        # Apply Fully Sharded Data Parallelism to the model
+        if self.data_parallel_dim > 1:
+            fsdp_shard_conditions = [
+                partial(
+                    training.get_shard_conditions,
+                    names_to_match=custom_sharded_layers,
+                )
+            ]
+            training.shard_model(
+                model=model,
+                shard_conditions=fsdp_shard_conditions,
+                cpu_offload=fsdp_cpu_offload,
+                reshard_after_forward=reshard_after_forward,
+                dp_mesh=device_mesh["dp"],
             )
-        ]
-
-        training.shard_model(
-            model=model,
-            shard_conditions=fsdp_shard_conditions,
-            cpu_offload=fsdp_cpu_offload,
-            reshard_after_forward=True,
-        )
-
-        # training.shard_model(
-        #     model=ref_model,
-        #     shard_conditions=fsdp_shard_conditions,
-        #     cpu_offload=fsdp_cpu_offload,
-        #     reshard_after_forward=True,
-        # )
 
         with training.set_default_dtype(self._dtype), self._device:
             for m in model.modules():
                 # RoPE is not covered in state dict
                 if hasattr(m, "rope_init"):
                     m.rope_init()
-
-            # for m in ref_model.modules():
-            #     if hasattr(m, "rope_init"):
-            #         m.rope_init()
 
         # This method will convert the full model state dict into a sharded state
         # dict and load into the model
@@ -1119,22 +1068,8 @@ class PyTorchActorModel:
             cpu_offload=fsdp_cpu_offload,
         )
 
-        # training.load_from_full_model_state_dict(
-        #     ref_model,
-        #     ref_model_state_dict,
-        #     self._device,
-        #     strict=True,
-        #     cpu_offload=fsdp_cpu_offload,
-        # )
-
         # Ensure no params and buffers are on meta device
         training.validate_no_params_on_meta_device(model)
-        # training.validate_no_params_on_meta_device(ref_model)
-
-        # utils.log_rank_zero(
-        #     log,
-        #     f"Instantiating model and loading checkpoint took {time.perf_counter() - init_start:.2f} secs",
-        # )
 
         self.activations_handling_ctx = training.get_act_offloading_ctx_manager(
             model, enable_activation_offloading
@@ -1144,26 +1079,22 @@ class PyTorchActorModel:
             memory_stats = training.get_memory_stats(device=self._device)
             training.log_memory_stats(memory_stats)
 
-        disable_dropout(model)
-        # disable_dropout(ref_model)
-
         # synchronize before training begins
         torch.distributed.barrier()
 
-        return model  # , ref_model
+        return model
 
     def _setup_optimizer(
         self, cfg_optimizer: DictConfig, opt_state_dict=None
     ) -> Optional[Optimizer]:
         optimizer = config.instantiate(cfg_optimizer, self._model.parameters())
-        if opt_state_dict:
-            assert opt_state_dict is None, "Optimizer state dict is not supported yet"
-            # training.load_from_full_optimizer_state_dict(
-            #     self._model,
-            #     optimizer,
-            #     opt_state_dict,
-            #     self._device,
-            # )
+        if opt_state_dict is not None:
+            training.load_from_full_optimizer_state_dict(
+                self._model,
+                optimizer,
+                opt_state_dict,
+                self._device,
+            )
         return optimizer
 
     def grpo_step(
@@ -1187,10 +1118,6 @@ class PyTorchActorModel:
 
         """
         torch.cuda.empty_cache()
-        if self._is_rank_zero:
-            print("context_length", context_length)
-            print([f.shape for f in trajectory if f is not None])
-
         # Create an output mask to avoid computing model.output on tokens we won't train on
         # We don't need to compute logits for the prompt tokens (except the last one which is used for the first prediction)
         # and we don't need the logit for the last token (as there's no next token to predict)
@@ -1207,26 +1134,6 @@ class PyTorchActorModel:
                 mask=trajectory.masks,
                 output_mask=output_mask,
             )
-
-        # pi_logits = rlhf.truncate_sequence_for_logprobs(pi_logits, context_length)
-        # pi_logprobs = rlhf.batched_logits_to_logprobs(
-        #     pi_logits,
-        #     trajectory.query_responses[:, context_length:],
-        #     self._temperature,
-        #     chunk_size=1,
-        # )
-
-        # pi_logprobs[trajectory.response_padding_masks] = 1.0
-        # trajectory.ref_logprobs[trajectory.response_padding_masks] = 1.0
-
-        if self._is_rank_zero:
-            # print(
-            #     "ref_logprobs shape", trajectory.ref_logprobs.shape, pi_logprobs.shape
-            # )
-            # print(torch.abs(pi_logprobs - trajectory.ref_logprobs).max())
-            # print(torch.abs(pi_logprobs - trajectory.ref_logprobs).mean())
-            # print(pi_logprobs)
-            print(trajectory.ref_logprobs)
 
         torch.cuda.empty_cache()
 
@@ -1251,8 +1158,6 @@ class PyTorchActorModel:
 
         torch.cuda.empty_cache()
         loss.backward()
-
-        print("done grpo step")
 
         return GRPOStats(
             loss,
@@ -1402,271 +1307,220 @@ class PyTorchActorModel:
         ray.get(self._metric_logger.log_dict.remote(log_dict, step=step_idx))
 
     def train(self):
-        if self._is_rank_zero:
-            self._vllm_engines[0].print_me.remote(
-                "hello vllm worker, it's fsdp rank zero!"
-            )
-        from torchtune import generation
-        from torchtune.dev.grpo.rewards import batched_rewards
-
         training.cleanup_before_training()
         self._optimizer.zero_grad()
-
-        training_completed = False
-        grpo_size = self.grpo_samples
-        batch_size = self.batch_size
-
         self._profiler.start()
 
-        # for curr_epoch in range(self._epochs_run, self.total_epochs):
-        for curr_epoch in range(1):
-            print("starting")
+        while num_training_steps < self.max_training_steps:
+            time_step_start = time.perf_counter()
 
-            dataloader_done = False
-            while not dataloader_done:
-                time_step_start = time.perf_counter()
+            # Grab the next round of trajectories for training
+            if self.rank == 0:
+                train_replay_buffer_size = self.replay_buffer.write_count
+            time_waiting_buffer_start = time.perf_counter()
+            while not len(self.replay_buffer):
+                print("Waiting for replay buffer...")
+                time.sleep(1.0)
+            trajectory = self.replay_buffer.sample(batch_size=batch_size)[0]
+            trajectory = trajectory.to(self._device)
+            time_waiting_buffer = time.perf_counter() - time_waiting_buffer_start
 
-                # Measure time waiting for buffer
-                time_waiting_buffer_start = time.perf_counter()
-                trajectory = None
-                if self._is_rank_zero:
-                    train_replay_buffer_size = self.replay_buffer.qsize()
-                while trajectory is None:
-                    try:
-                        if self._is_rank_zero:
-                            print(f"{self.rank=} Getting from replay_buffer queue.")
-                        trajectory = self.replay_buffer.get(timeout=0.5)
-                        # Move tensors back to GPU
-                        trajectory = [
-                            (
-                                tensor.to(self._device)
-                                if isinstance(tensor, torch.Tensor)
-                                else tensor
-                            )
-                            for tensor in trajectory
-                        ]
-                    except ray.util.queue.Empty:
-                        trajectory = None
-                        time.sleep(0.1)
-                time_waiting_buffer = time.perf_counter() - time_waiting_buffer_start
+            # Start tracking CUDA memory for active steps for just the first epoch
+            if (
+                self.rank == 0
+                and curr_epoch == 0
+                and self.profiler_profile_memory
+                and self._steps_run
+                == self.profiler_wait_steps + self.profiler_warmup_steps
+            ):
+                print("starting _record_memory_history")
+                torch.cuda.memory._record_memory_history()
 
-                print(f"{self.rank=} got from queue")
+            (
+                query_responses,
+                responses,
+                logprobs,
+                ref_logprobs,
+                query_response_padding_masks,
+                seq_lens,
+                answers,
+                policy_version,
+            ) = trajectory
 
-                # Start tracking CUDA memory for active steps for just the first epoch
-                if (
-                    self._is_rank_zero
-                    and curr_epoch == 0
-                    and self.profiler_profile_memory
-                    and self._steps_run
-                    == self.profiler_wait_steps + self.profiler_warmup_steps
-                ):
-                    print("starting _record_memory_history")
-                    torch.cuda.memory._record_memory_history()
+            # Compute padded tokens percentage
+            total_tokens = query_responses.numel()
+            padded_tokens = (query_responses == self._tokenizer.pad_id).sum().item()
+            padded_tokens_percentage = (
+                (padded_tokens / total_tokens) * 100 if total_tokens > 0 else 0
+            )
+            number_of_tokens = seq_lens.sum().item()
 
-                # # hacky way of coordinating between vllm and actor that dataloader is done
-                # # since vllm worker now "owns" the dataloader
-                # if len(trajectory) == 1:
-                #     print(f"{self.rank=} got done")
-                #     dataloader_done = True
-                #     torch.distributed.barrier()
-                #     torch.cuda.synchronize()
-                #     print(f"{self.rank=} returning")
-                #     return
+            # Reset peak memory stats before GRPO steps
+            torch.cuda.reset_peak_memory_stats()
 
-                # print(f"{self.rank=} got trajectory, {len(trajectory)}, {trajectory[0].device}")
-                (
-                    query_responses,
+            # FIXME: move stop token tensor to __init__
+            response_padding_masks, responses = (
+                rlhf.truncate_sequence_at_first_stop_token(  # [B x G, L]
                     responses,
-                    logprobs,
-                    ref_logprobs,
-                    query_response_padding_masks,
-                    seq_lens,
-                    answers,
-                    policy_version,
-                ) = trajectory
-
-                # Compute padded tokens percentage
-                total_tokens = query_responses.numel()
-                padded_tokens = (query_responses == self._tokenizer.pad_id).sum().item()
-                padded_tokens_percentage = (
-                    (padded_tokens / total_tokens) * 100 if total_tokens > 0 else 0
+                    torch.tensor(self._tokenizer.stop_tokens, device=self._device),
+                    self._tokenizer.pad_id,
                 )
-                number_of_tokens = seq_lens.sum().item()
+            )
 
-                # Reset peak memory stats before GRPO steps
-                torch.cuda.reset_peak_memory_stats()
+            masks = generation.get_causal_mask_from_padding_mask(
+                query_response_padding_masks
+            )
+            position_ids = generation.get_position_ids_from_padding_mask(
+                query_response_padding_masks
+            )
+            del query_response_padding_masks
 
-                # FIXME: move stop token tensor to __init__
-                response_padding_masks, responses = (
-                    rlhf.truncate_sequence_at_first_stop_token(  # [B x G, L]
-                        responses,
-                        torch.tensor(self._tokenizer.stop_tokens, device=self._device),
-                        self._tokenizer.pad_id,
+            context_length = query_responses.shape[1] - responses.shape[1]
+
+            # compute rewards
+            responses = responses.reshape(batch_size, grpo_size, -1)
+            rewards_full, successes_full, reward_metadata = batched_rewards(
+                self._tokenizer, responses, answers, device=self._device
+            )
+
+            # B, G, num_funcs -> B, G
+            rewards_sum = rewards_full.sum(-1)
+
+            # advantage
+            advantages = (rewards_sum - rewards_sum.mean(1, keepdim=True)) / (
+                rewards_sum.std(1, keepdim=True) + 1e-4
+            )
+            advantages = advantages.reshape(batch_size * grpo_size)
+
+            trajectory = GRPOTrajectory(
+                query_responses=query_responses,
+                logprobs=logprobs,
+                ref_logprobs=ref_logprobs,
+                advantages=advantages,
+                masks=masks,
+                position_ids=position_ids,
+                response_padding_masks=response_padding_masks,
+                seq_lens=training.get_unmasked_sequence_lengths(response_padding_masks),
+            )
+
+            # for logging
+            torch.distributed.reduce(
+                rewards_full, dst=0, op=torch.distributed.ReduceOp.AVG
+            )
+            torch.distributed.reduce(
+                successes_full, dst=0, op=torch.distributed.ReduceOp.AVG
+            )
+            rewards_mean_per_func = rewards_full.mean(dim=(0, 1)).cpu()
+            successes_mean_per_func = successes_full.mean(dim=(0, 1)).cpu()
+            rewards_mean = rewards_mean_per_func.mean()
+            successes_mean = successes_mean_per_func.mean()
+
+            del rewards_full, successes_full, responses, rewards_sum
+
+            # TODO: do we need a barrier here?
+            torch.distributed.barrier()
+
+            # Measure compute time across all GRPO steps
+            time_grpo_steps = 0
+            time_grpo_steps_start = time.perf_counter()
+            grpo_stats: list[GRPOStats] = []
+            for _ in range(self._ppo_epochs):
+                step_stats = self.grpo_step(trajectory, context_length)
+                grpo_stats.append(step_stats)
+
+                if self._clip_grad_norm is not None:
+                    grad_norm = torch.nn.utils.clip_grad_norm_(
+                        self._model.parameters(),
+                        max_norm=float(self._clip_grad_norm),
                     )
-                )
-
-                masks = generation.get_causal_mask_from_padding_mask(
-                    query_response_padding_masks
-                )
-                position_ids = generation.get_position_ids_from_padding_mask(
-                    query_response_padding_masks
-                )
-                del query_response_padding_masks
-
-                context_length = query_responses.shape[1] - responses.shape[1]
-
-                # compute rewards
-                responses = responses.reshape(batch_size, grpo_size, -1)
-                rewards_full, successes_full, reward_metadata = batched_rewards(
-                    self._tokenizer, responses, answers, device=self._device
-                )
-
-                # B, G, num_funcs -> B, G
-                rewards_sum = rewards_full.sum(-1)
-
-                # advantage
-                advantages = (rewards_sum - rewards_sum.mean(1, keepdim=True)) / (
-                    rewards_sum.std(1, keepdim=True) + 1e-4
-                )
-                advantages = advantages.reshape(batch_size * grpo_size)
-
-                trajectory = GRPOTrajectory(
-                    query_responses=query_responses,
-                    logprobs=logprobs,
-                    ref_logprobs=ref_logprobs,
-                    advantages=advantages,
-                    masks=masks,
-                    position_ids=position_ids,
-                    response_padding_masks=response_padding_masks,
-                    seq_lens=training.get_unmasked_sequence_lengths(
-                        response_padding_masks
-                    ),
-                )
-
-                # for logging
-                torch.distributed.reduce(
-                    rewards_full, dst=0, op=torch.distributed.ReduceOp.AVG
-                )
-                torch.distributed.reduce(
-                    successes_full, dst=0, op=torch.distributed.ReduceOp.AVG
-                )
-                rewards_mean_per_func = rewards_full.mean(dim=(0, 1)).cpu()
-                successes_mean_per_func = successes_full.mean(dim=(0, 1)).cpu()
-                rewards_mean = rewards_mean_per_func.mean()
-                successes_mean = successes_mean_per_func.mean()
-
-                del rewards_full, successes_full, responses, rewards_sum
-
-                # TODO: do we need a barrier here?
+                torch.distributed.barrier()
+                self._optimizer.step()
+                self._optimizer.zero_grad(set_to_none=True)
                 torch.distributed.barrier()
 
-                # Measure compute time across all GRPO steps
-                time_grpo_steps = 0
-                time_grpo_steps_start = time.perf_counter()
-                grpo_stats: list[GRPOStats] = []
-                for _ in range(self._ppo_epochs):
+                self.global_step += 1
 
-                    step_stats = self.grpo_step(trajectory, context_length)
+                if self._lr_scheduler is not None:
+                    self._lr_scheduler.step()
 
-                    grpo_stats.append(step_stats)
+                print(f"{self.rank=} finished step {self._steps_run}")
 
-                    if self._clip_grad_norm is not None:
-                        grad_norm = torch.nn.utils.clip_grad_norm_(
-                            self._model.parameters(),
-                            max_norm=float(self._clip_grad_norm),
-                        )
-                    torch.distributed.barrier()
-                    self._optimizer.step()
-                    self._optimizer.zero_grad(set_to_none=True)
-                    torch.distributed.barrier()
+            time_grpo_steps = time.perf_counter() - time_grpo_steps_start
+            self._steps_run += 1
 
-                    self.global_step += 1
+            # Compute policy age
+            policy_age = self.policy_version - policy_version
 
-                    if self._lr_scheduler is not None:
-                        self._lr_scheduler.step()
+            # Handle weight synchronization
+            time_weight_sync = 0
+            time_weight_gather = 0
+            if self._steps_run % self._steps_before_sync == 0:
+                print("started weight sync")
+                torch.distributed.barrier()
 
-                    print(f"{self.rank=} finished step {self._steps_run}")
-
-                time_grpo_steps = time.perf_counter() - time_grpo_steps_start
-                self._steps_run += 1
-
-                # Compute policy age
-                policy_age = self.policy_version - policy_version
-
-                # Handle weight synchronization
-                time_weight_sync = 0
-                time_weight_gather = 0
-                if self._steps_run % self._steps_before_sync == 0:
-                    print("started weight sync")
-                    torch.distributed.barrier()
-
-                    time_weight_gather_start = time.perf_counter()
-                    # gather all parameters
-                    new_sd = {}
-                    for k, v in self._model.state_dict().items():
-                        new_sd[k] = v.full_tensor()
-                    torch.cuda.synchronize()
-                    time_weight_gather = time.perf_counter() - time_weight_gather_start
-
-                    if self._is_rank_zero:
-                        print(f"Done gather in {time_weight_gather}")
-
-                    time_sync_start = time.perf_counter()
-                    self.sync_weights(new_sd)
-                    del new_sd
-                    time_weight_sync = time.perf_counter() - time_sync_start
-
-                # Log metrics
-                total_step_time = time.perf_counter() - time_step_start
-                total_step_time = time.perf_counter() - time_step_start
-                policy_age = self.policy_version - policy_version
+                time_weight_gather_start = time.perf_counter()
+                # gather all parameters
+                new_sd = {}
+                for k, v in self._model.state_dict().items():
+                    new_sd[k] = v.full_tensor()
+                torch.cuda.synchronize()
+                time_weight_gather = time.perf_counter() - time_weight_gather_start
 
                 if self._is_rank_zero:
-                    self._log_metrics(
-                        step_idx=self.global_step,
-                        trajectory=trajectory,
-                        grpo_stats=grpo_stats,
-                        total_step_time=total_step_time,
-                        time_grpo_steps=time_grpo_steps,
-                        time_waiting_buffer=time_waiting_buffer,
-                        time_weight_sync=time_weight_sync,
-                        time_weight_gather=time_weight_gather,
-                        number_of_tokens=number_of_tokens,
-                        padded_tokens_percentage=padded_tokens_percentage,
-                        policy_age=policy_age,
-                        rewards_mean=rewards_mean,
-                        successes_mean=successes_mean,
-                        rewards_mean_per_func=rewards_mean_per_func,
-                        successes_mean_per_func=successes_mean_per_func,
-                        reward_metada=reward_metadata,
-                        train_replay_buffer_size=train_replay_buffer_size,
-                    )
+                    print(f"Done gather in {time_weight_gather}")
 
-                # Step profiler
-                # Note that this is called within gradient accumulation block, hence
-                # will include multiple forward / backward passes if gradient accumulation > 1
-                self._profiler.step()
+                time_sync_start = time.perf_counter()
+                self.sync_weights(new_sd)
+                del new_sd
+                time_weight_sync = time.perf_counter() - time_sync_start
 
-                # Stop tracking CUDA memory now that active steps are complete
-                if (
-                    self._is_rank_zero
-                    and curr_epoch == 0
-                    and self.profiler_profile_memory
-                    and self._steps_run
-                    == self.profiler_wait_steps
-                    + self.profiler_warmup_steps
-                    + self.profiler_active_steps
-                    and self._device.type == "cuda"
-                ):
-                    print("stop _record_memory_history")
-                    torch.cuda.memory._record_memory_history(enabled=None)
+            # Log metrics
+            total_step_time = time.perf_counter() - time_step_start
+            total_step_time = time.perf_counter() - time_step_start
+            policy_age = self.policy_version - policy_version
 
-                torch.distributed.barrier()
-                self.cleanup_after_step(trajectory, grpo_stats)
+            if self._is_rank_zero:
+                self._log_metrics(
+                    step_idx=self.global_step,
+                    trajectory=trajectory,
+                    grpo_stats=grpo_stats,
+                    total_step_time=total_step_time,
+                    time_grpo_steps=time_grpo_steps,
+                    time_waiting_buffer=time_waiting_buffer,
+                    time_weight_sync=time_weight_sync,
+                    time_weight_gather=time_weight_gather,
+                    number_of_tokens=number_of_tokens,
+                    padded_tokens_percentage=padded_tokens_percentage,
+                    policy_age=policy_age,
+                    rewards_mean=rewards_mean,
+                    successes_mean=successes_mean,
+                    rewards_mean_per_func=rewards_mean_per_func,
+                    successes_mean_per_func=successes_mean_per_func,
+                    reward_metada=reward_metadata,
+                    train_replay_buffer_size=train_replay_buffer_size,
+                )
 
-                if self._steps_run == self._total_steps:
-                    training_completed = True
-                    return
+            # Step profiler
+            # Note that this is called within gradient accumulation block, hence
+            # will include multiple forward / backward passes if gradient accumulation > 1
+            self._profiler.step()
+
+            # Stop tracking CUDA memory now that active steps are complete
+            if (
+                self._is_rank_zero
+                and curr_epoch == 0
+                and self.profiler_profile_memory
+                and self._steps_run
+                == self.profiler_wait_steps
+                + self.profiler_warmup_steps
+                + self.profiler_active_steps
+                and self._device.type == "cuda"
+            ):
+                print("stop _record_memory_history")
+                torch.cuda.memory._record_memory_history(enabled=None)
+
+            torch.distributed.barrier()
+            self.cleanup_after_step(trajectory, grpo_stats)
 
         self._profiler.stop()
 
@@ -1704,25 +1558,20 @@ class PyTorchActorModel:
             pass
 
         torch.distributed.barrier()
-        print("waking up", flush=True)
-
-    def cleanup(self) -> None:
-        if self._is_rank_zero:
-            self._metric_logger.close()
 
 
-@ray.remote(num_cpus=1, num_gpus=0)
-class MetricLoggerActor:
-    def __init__(self, cfg):
-        self.logger = config.instantiate(cfg.metric_logger)
+# @ray.remote(num_cpus=1, num_gpus=0)
+# class MetricLoggerActor:
+#     def __init__(self, cfg):
+#         self.logger = config.instantiate(cfg.metric_logger)
 
-    def log_dict(self, log_dict, step=None):
-        # allowing actors to use their own step counters
-        self.logger.log_dict(log_dict, step=step)
+#     def log_dict(self, log_dict, step=None):
+#         # allowing actors to use their own step counters
+#         self.logger.log_dict(log_dict, step=step)
 
-    def close(self):
-        if hasattr(self.logger, "close"):
-            self.logger.close()
+#     def close(self):
+#         if hasattr(self.logger, "close"):
+#             self.logger.close()
 
 
 class RayGRPORecipe:
@@ -1899,17 +1748,39 @@ class RayGRPORecipe:
         ray.shutdown()
 
 
+# total_resources:
+#   num_cpus: 512
+#   num_gpus: 8
+
+# buffer:
+#   size: 1000
+
+# actor:
+#   resources:
+#       num_cpus: 0
+#       num_gpus: 1
+#   buffer_size: 1000
+#   batch_size: 1
+
+
 @config.parse
-def recipe_main(cfg: DictConfig) -> None:
+def main(cfg: DictConfig) -> None:
+    os.environ["PYTORCH_CUDA_ALLOC_CONF"] = "expandable_segments:True"
 
-    if cfg.get("enable_expandable_segments", True):
-        os.environ["PYTORCH_CUDA_ALLOC_CONF"] = "expandable_segments:True"
+    config.log_config(recipe_name="GRPO example recipe", cfg=cfg)
+    ray.init(**cfg.total_resources)
 
-    recipe = RayGRPORecipe()
-    recipe.setup(cfg)
-    recipe.train()
-    recipe.stop_ray()
+    # Setup data collection
+    rollout_buffer = Queue(maxsize=cfg.buffer.size)
+    action_buffer = RayReplayBuffer(
+        storage=functools.partial(LazyStackStorage, max_size=cfg.actor.buffer_size),
+        batch_size=None,  # This will be overriden by .sample() method
+        remote_config=cfg.actor.resources,
+    )
+    envs = launch(
+        worker=LLMEnv,
+    )
 
 
 if __name__ == "__main__":
-    recipe_main()
+    sys.exit(main())
