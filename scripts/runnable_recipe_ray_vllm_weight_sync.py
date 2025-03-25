@@ -1,3 +1,4 @@
+#!/usr/bin/env python3
 """
 README!! What's going on in this script?
 
@@ -62,10 +63,12 @@ from ray.util.placement_group import placement_group
 
 from ray.util.queue import Full as QueueFull, Queue
 from ray.util.scheduling_strategies import PlacementGroupSchedulingStrategy
+from tensordict import is_tensorclass, TensorClass
 from torch.optim import Optimizer
 
 from torchdata.stateful_dataloader import StatefulDataLoader
 from torchdata.stateful_dataloader.sampler import StatefulDistributedSampler
+from torchrl.data import LazyStackStorage, RayReplayBuffer
 from torchtune import config, generation, modules, rlhf, training, utils
 from torchtune.dev.grpo.types import GRPOStats, GRPOTrajectory
 from torchtune.models import qwen2_5
@@ -74,14 +77,13 @@ from torchtune.rlhf import Trajectory
 
 from torchtune.training import DummyProfiler, PROFILER_KEY
 from torchtune.training.lr_schedulers import get_lr
-from torchrl.data import RayReplayBuffer, LazyStackStorage
-from tensordict import TensorClass, is_tensorclass
 
 from vllm import LLM, SamplingParams
 from vllm.utils import get_ip, get_open_port
 from vllm.worker.worker import Worker
 
 log = utils.get_logger("DEBUG")
+
 
 class Trajectory(TensorClass["nocast"]):
     query_responses: torch.Tensor
@@ -206,8 +208,8 @@ class RefActor:
         time_total_ref_step,
         time_model_running,
         time_waiting_buffer,
-        #full_queue_data_discard,
-        #rollout_queue_length,
+        # full_queue_data_discard,
+        # rollout_queue_length,
     ):
         """Log metrics for the RefActor, only on actor zero."""
         if not self._is_actor_zero:
@@ -333,7 +335,7 @@ class RefActor:
                 seq_lens=seq_lens,
                 answers=answers,
                 policy_version=policy_version,
-                batch_size = batch_size
+                batch_size=batch_size,
             )
             print(f"putting trajectory {trajectory} into actor queue")
 
@@ -540,7 +542,7 @@ class vLLMRolloutActor:
     def rollout(self):
         sampling_params = SamplingParams(
             # FIXME: can just directly change n to grpo_size instead of repeating prompt grpo_size times
-            n=1,
+            n=self.grpo_samples,
             max_tokens=self._max_generated_tokens,
             temperature=self._temperature,
             # nondeterministically returns more than 1??
@@ -549,12 +551,15 @@ class vLLMRolloutActor:
 
         def postprocess_vllm_request_output(request_output):
             bs = len(request_output)
+            print(f"len req output: {bs}")
+            print(f"\n\nrequest_output\n\n{request_output}")
             prompt_tokens = []
             response_tokens = []
             logprobs = []
             prompt_tokens = request_output[0].prompt_token_ids
             for output in request_output:
-                assert len(output.outputs) == 1
+                print(f"Len of outputs: {len(output.outputs)}")
+                assert len(output.outputs) == self.grpo_samples
                 # vllm doesn't return prompt as part of output so we need to add it back later
                 tokens = list(output.outputs[0].token_ids)
                 response_tokens.append(tokens)
@@ -636,11 +641,11 @@ class vLLMRolloutActor:
                 return
 
             # FIXME: tokens is currently on cpu, is this right?s
-            tokens, answers = batch["tokens"], batch["answers"]
-            batch_tokens = tokens[:, None, :].expand(-1, self.grpo_samples, -1)
-            batch_tokens = batch_tokens.reshape(self.batch_size * self.grpo_samples, -1)
+            tokens, answers = batch["tokens"].numpy().tolist(), batch["answers"]
             # A downside is they only seem to take in List[List[int]] and not torch.Tensor :(
-            batch_tokens = batch_tokens.numpy().tolist()
+            # batch_tokens = batch_tokens.numpy().tolist()
+
+            print(f'tokens shape: {batch["tokens"].shape}')
 
             # Reset GPU memory stats before generation
             torch.cuda.reset_peak_memory_stats(device="cuda:0")
@@ -649,10 +654,11 @@ class vLLMRolloutActor:
             # do the generation
             result = self.llm.generate(
                 prompts=None,
-                prompt_token_ids=batch_tokens,
+                prompt_token_ids=tokens,
                 sampling_params=sampling_params,
                 use_tqdm=False,
             )
+
             time_generate = time.perf_counter() - time_generate_start
 
             postprocessed_results = postprocess_vllm_request_output(result)
@@ -667,6 +673,13 @@ class vLLMRolloutActor:
             ) = postprocessed_results
             # Compute total generated tokens for tokens per second
             total_generated_tokens = seq_lens.sum().item()
+
+            print(f"query_responses shape: {query_responses.shape}")
+            print(f"logprobs shape: {logprobs.shape}")
+            print(f"responses shape: {responses.shape}")
+            print(
+                f"query_response_padding_masks shape: {query_response_padding_masks.shape}"
+            )
 
             postprocessed_results.append(answers)
             postprocessed_results.append(self.policy_version)
@@ -1435,7 +1448,7 @@ class PyTorchActorModel:
                 if self._is_rank_zero:
                     train_replay_buffer_size = self.replay_buffer.write_count
                 while not len(self.replay_buffer):
-                    print('waiting for replay buffer')
+                    print("waiting for replay buffer")
                     time.sleep(1.0)
                 if self._is_rank_zero:
                     print(f"{self.rank=} Getting from replay_buffer queue.")
@@ -1473,7 +1486,9 @@ class PyTorchActorModel:
                     responses = trajectory.responses
                     logprobs = trajectory.logprobs
                     ref_logprobs = trajectory.ref_logprobs
-                    query_response_padding_masks = trajectory.query_response_padding_masks
+                    query_response_padding_masks = (
+                        trajectory.query_response_padding_masks
+                    )
                     seq_lens = trajectory.seq_lens
                     answers = trajectory.answers
                     policy_version = trajectory.policy_version
@@ -1484,11 +1499,15 @@ class PyTorchActorModel:
                     responses = trajectory["responses"]
                     logprobs = trajectory["logprobs"]
                     ref_logprobs = trajectory["ref_logprobs"]
-                    query_response_padding_masks = trajectory["query_response_padding_masks"]
+                    query_response_padding_masks = trajectory[
+                        "query_response_padding_masks"
+                    ]
                     seq_lens = trajectory["seq_lens"]
                     answers = trajectory["answers"]
                     policy_version = trajectory["policy_version"]
-                    print(f'expected a tensorclass but got a tensordict on rank {self.rank}')
+                    print(
+                        f"expected a tensorclass but got a tensordict on rank {self.rank}"
+                    )
 
                 # Compute padded tokens percentage
                 total_tokens = query_responses.numel()
@@ -1745,7 +1764,11 @@ class RayGRPORecipe:
             actor_options={"num_cpus": 10, "num_gpus": 0},
             maxsize=cfg.vllm.queue_maxsize,
         )
-        self.replay_buffer = RayReplayBuffer(storage=functools.partial(LazyStackStorage, max_size=1000), batch_size=1, remote_config={"num_cpus": 10, "num_gpus": 0})
+        self.replay_buffer = RayReplayBuffer(
+            storage=functools.partial(LazyStackStorage, max_size=1000),
+            batch_size=1,
+            remote_config={"num_cpus": 10, "num_gpus": 0},
+        )
 
         # Create workers using config values directly
         self.rollout_workers = self._create_vllm_workers()
