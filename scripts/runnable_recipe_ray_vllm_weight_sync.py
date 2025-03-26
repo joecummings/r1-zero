@@ -144,8 +144,8 @@ class PaddedTrajectoryBatch(TensorClass["nocast"]):
     prompts_str: str  # size is [batch]
     responses_str: str  # size is [batch, grpo_size]
 
-    prompt_token_ids: torch.LongTensor  # [batch, max_prompt_len]
-    response_token_ids: torch.LongTensor  # [batch, grpo_size, max_response_len]
+    prompt_tokens: torch.LongTensor  # [batch, max_prompt_len]
+    response_tokens: torch.LongTensor  # [batch, grpo_size, max_response_len]
 
     logprobs: torch.Tensor  # [batch, grpo_size, max_response_len]
     ref_logprobs: torch.Tensor  # [batch, grpo_size, max_response_len]
