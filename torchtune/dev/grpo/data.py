@@ -71,11 +71,13 @@ class RLDataset(Dataset):
 
         question = BASE_PROMPT % transformed_sample["question"]
 
-        q_tokens = self._tokenizer.encode(question, add_eos=False)
-        mask = [1 for _ in q_tokens]
+        # q_tokens = self._tokenizer.encode(question, add_eos=False)
+        # mask = [1 for _ in q_tokens]
         answer = transformed_sample["answer"]
+    
+        return {"question": question, "answer": answer}
 
-        return {"tokens": q_tokens, "mask": mask, "answer": answer}
+        # return {"tokens": q_tokens, "mask": mask, "answer": answer}
 
 
 def padded_collate_rl(

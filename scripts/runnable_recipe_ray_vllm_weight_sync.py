@@ -85,6 +85,7 @@ from vllm import LLM, SamplingParams
 from vllm.utils import get_ip, get_open_port
 from vllm.worker.worker import Worker
 
+from torchrl.collectors.distributed import RayCollector
 from torchrl.collectors.vllm_weight_update import vLLMHFLocalWeightUpdater, vLLMRemoteWeightUpdaterBase, WorkerExtension
 
 log = utils.get_logger("DEBUG")
@@ -738,6 +739,142 @@ class vLLMRolloutActor:
                     gpu_memory=gpu_memory,
                 )
             idx += 1
+
+
+def make_llm_env(cfg, rank, num_replicas):
+    from torchdata.stateful_dataloader import StatefulDataLoader
+    from torchdata.stateful_dataloader.sampler import StatefulDistributedSampler
+    from transformers import AutoTokenizer
+    from tensordict import TensorDict
+
+    def _setup_data(
+        cfg_dataset: DictConfig,
+        shuffle: bool,
+        batch_size: int,
+        # collate_fn: str,
+        dataloader_state_dict: Optional[Dict[str, Any]] = None,
+        rank: int = 0,
+        num_replicas: int = 1,
+    ) -> StatefulDataLoader:
+        """
+        All data related setup happens here. Currently this recipe only supports the
+        DistributedSamplers with Map-style Datasets which fit into memory. Other samplers,
+        iterable datasets and streaming datasets are not supported.
+        """
+        # Not importing here and doing these imports globally will cause vLLM worker
+        # to have no cuda devices during cuda lazy init for some reason?? Even when
+        # this method is not actually called...
+        from torchtune import config
+        from torchtune.config._utils import _get_component_from_path
+        from torchtune.datasets import ConcatDataset
+
+        if isinstance(cfg_dataset, ListConfig):
+            datasets = [
+                config.instantiate(single_cfg_dataset, _tokenizer)
+                for single_cfg_dataset in cfg_dataset
+            ]
+            ds = ConcatDataset(datasets=datasets)
+        else:
+            ds = config.instantiate(cfg_dataset, _tokenizer)
+
+        # collate_fn = _get_component_from_path(collate_fn)
+
+        def collate_fn(batch):
+            batch = torch.stack([TensorDict.from_dict(_batch) for _batch in batch])
+            batch.rename_key_("question", "text")
+            return batch
+
+        sampler = StatefulDistributedSampler(
+            ds,
+            num_replicas=num_replicas,
+            rank=rank,
+            shuffle=shuffle,
+            # FIXME: set seed?
+            # seed=seed,
+        )
+        dataloader = StatefulDataLoader(
+            dataset=ds,
+            batch_size=batch_size,
+            sampler=sampler,
+            collate_fn=collate_fn,
+            # dropping last avoids shape issues with compile + flex attention
+            drop_last=True,
+        )
+        if dataloader_state_dict is not None:
+            assert False, "Haven't handled dataloader_state_dict yet"
+            dataloader.load_state_dict(dataloader_state_dict)
+            # B/c we currently only save at epoch boundaries, if we cut the previous epoch short
+            # we need to force the dataloader to finish the last iteration before it's actually used
+            list(dataloader)
+        return dataloader
+
+    cfg = cfg
+    grpo_samples = cfg.grpo_samples
+    batch_size = cfg.batch_size
+    # _tokenizer = config.instantiate(cfg.tokenizer)
+    # collate_name = cfg.get(
+    #     "collate_fn", "torchtune.dev.grpo.data.padded_collate_rl"
+    # )
+    _tokenizer = AutoTokenizer.from_pretrained("Qwen/Qwen2.5-3B")
+    _tokenizer.pad_token = _tokenizer.eos_token
+    _tokenizer.padding_side = "left"
+    _dataloader = _setup_data(
+        cfg.dataset,
+        shuffle=cfg.shuffle,
+        batch_size=2,
+        # collate_fn=collate_name,
+        rank=rank,
+        num_replicas=num_replicas,
+    )
+
+    
+    from torchrl.envs import LLMEnv
+    llmenv = LLMEnv.from_dataloader(
+        dataloader=_dataloader,
+        tokenizer=_tokenizer,
+        # FIXME: Need to convert to str2str=True
+        str2str=False,
+        batch_size=(batch_size,),
+        repeats=grpo_samples,
+        group_repeats=True,
+        has_attention=False,
+    )
+    return llmenv
+
+def make_policy(cfg):
+    from vllm import LLM, SamplingParams
+    from torchrl.modules import from_vllm
+    from transformers import AutoTokenizer
+
+    vllm_tp_size = cfg.vllm.tp_size
+
+    inference_model = LLM(
+        model="Qwen/Qwen2.5-3B",
+        enforce_eager=True,
+        enable_chunked_prefill=True,
+        dtype="bfloat16",
+        worker_cls=WorkerExtension,
+        tensor_parallel_size=vllm_tp_size,
+        gpu_memory_utilization=cfg.vllm.gpu_memory_utilization,
+        # FIXME: Need to update torchlrl.collectors.distributed.as_remote
+        # in order to use distributed_executor_backend="ray"
+        # distributed_executor_backend="ray",
+    )
+
+    generate_kwargs = dict(
+        n=1,
+        max_tokens=cfg.max_generated_tokens,
+        temperature = cfg.temperature,
+    )
+
+    tokenizer = AutoTokenizer.from_pretrained("Qwen/Qwen2.5-3B")
+    tokenizer.pad_token = tokenizer.eos_token
+    tokenizer.padding_side = "left"
+
+    policy = from_vllm(
+        inference_model, tokenizer=tokenizer, from_text=False, generate=True, return_log_probs=True, generate_kwargs=generate_kwargs
+    )
+    return policy
 
 
 class vLLMWorkerWrapper(Worker):
@@ -1635,7 +1772,6 @@ class vLLMParameterServer(vLLMRemoteWeightUpdaterBase):
         self.rank = int(os.environ["RANK"])
         self.world_size = int(os.environ["WORLD_SIZE"])
         assert self.rank == self.world_size - 1
-        print(self.rank)
 
         # FIXME: why this hang even when I pass use_local_synchronization=False in the other one??
         # self.fsdp_group = torch.distributed.new_group(ranks=list(range(self.world_size - 1)))
@@ -1682,12 +1818,13 @@ class RayGRPORecipe:
         self.replay_buffer = RayReplayBuffer(storage=functools.partial(LazyStackStorage, max_size=self.cfg.vllm.queue_maxsize), batch_size=1, remote_config={"num_cpus": 10, "num_gpus": 0})
 
         # Create workers using config values directly
-        self.rollout_workers = self._create_vllm_workers()
+        # self.rollout_workers = self._create_vllm_workers()
+        self.collector = self._create_collector()
         self.ref_workers = self._create_ref_workers()
         self.actor_workers, self.param_server = self._create_fsdp_group_and_param_server(
             worker_cls=PyTorchActorModel, parameter_server_cls=vLLMParameterServer, fsdp_world_size=self.num_fsdp_workers, num_vllm_workers=self.num_vllm_workers
         )
-        self._init_weight_sync_pg()
+        # self._init_weight_sync_pg()
 
         # needs to happens after workers are created
         # or there are conflicts with the placement group
@@ -1706,8 +1843,8 @@ class RayGRPORecipe:
     def _set_metric_logger_to_actors(self):
         self.metric_logger = MetricLoggerActor.remote(self.cfg)
         # Pass the logger handle to each worker
-        for worker in self.rollout_workers:
-            worker.set_metric_logger.remote(self.metric_logger)
+        # for worker in self.rollout_workers:
+        #     worker.set_metric_logger.remote(self.metric_logger)
         for worker in self.ref_workers:
             worker.set_metric_logger.remote(self.metric_logger)
         for worker in self.actor_workers:
@@ -1755,6 +1892,30 @@ class RayGRPORecipe:
             cfg=self.cfg,
         )
         return worker
+    
+    def _create_collector(self):
+        def make_env_wrapper(rank):
+            def wrapper():
+                return make_llm_env(self.cfg, rank=rank, num_replicas=self.num_vllm_workers)
+            return wrapper
+        
+        def make_policy_wrapper():
+            return make_policy(self.cfg)
+        
+        remote_configs = {
+            "num_cpus": self.cfg.vllm.tp_size,
+            "num_gpus": self.cfg.vllm.tp_size,
+            # "memory": 2 * 1024**3,
+        }
+        collector = RayCollector(
+            [make_env_wrapper(rank) for rank in range(self.num_vllm_workers)],
+            policy_factory=make_policy_wrapper,
+            frames_per_batch=1,
+            total_frames=200,
+            remote_configs=remote_configs,
+            num_collectors=4,
+        )
+        return collector
 
     def _create_vllm_workers(self):
         llms = []
@@ -1841,10 +2002,27 @@ class RayGRPORecipe:
         ray.get(self.actor_workers[0].set_vllm_engines.remote(self.rollout_workers))
 
     def train(self):
-        rollout_handles = [worker.rollout.remote() for worker in self.rollout_workers]
-        self.rollout_workers[0].print_me.remote("hello vllm worker, it's __main__")
+        # rollout_handles = [worker.rollout.remote() for worker in self.rollout_workers]
+        # self.rollout_workers[0].print_me.remote("hello vllm worker, it's __main__")
+        for i, data in enumerate(self.collector):
+            # data = data.to_padded_tensor(0.0)
+            print(data)
+        
+            if i == 2:
+                break
+        return
         ref_handles = [worker.run.remote() for worker in self.ref_workers]
         worker_handles = [worker.train.remote() for worker in self.actor_workers]
+
+        # for i, data in enumerate(self.collector):
+        #     prompt_tokens = data["prompt_tokens"]
+        #     response_tokens = data["response_tokens"]
+        #     logprobs = data["logprobs"]
+        #     batch_size = data.batch_size
+
+
+
+
         ray.get(rollout_handles + ref_handles + worker_handles)
         ray.get(self.actor_workers[0].cleanup.remote())
 

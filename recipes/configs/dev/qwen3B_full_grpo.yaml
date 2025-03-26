@@ -118,6 +118,7 @@ vllm:
   tp_size: 1
   batch_size: 1 # TODO: for now, needs to match recipe batch size
   queue_maxsize: 3 #num workers * steps_before_sync
+  gpu_memory_utilization: 0.7
 
 
 # Logging
