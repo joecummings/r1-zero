@@ -49,7 +49,6 @@ from functools import partial
 from logging import log
 from re import S
 from typing import Any, Dict, List, Optional, Tuple, Union
-
 from warnings import warn
 
 import ray
@@ -63,7 +62,7 @@ from ray.util.placement_group import placement_group
 
 from ray.util.queue import Full as QueueFull, Queue
 from ray.util.scheduling_strategies import PlacementGroupSchedulingStrategy
-from tensordict import is_tensorclass, TensorClass
+from tensordict import is_tensorclass, pad_sequence, TensorClass, TensorDict
 from torch.optim import Optimizer
 
 from torchdata.stateful_dataloader import StatefulDataLoader
@@ -73,16 +72,50 @@ from torchtune import config, generation, modules, rlhf, training, utils
 from torchtune.dev.grpo.types import GRPOStats, GRPOTrajectory
 from torchtune.models import qwen2_5
 from torchtune.models.qwen2._convert_weights import qwen2_tune_to_hf
-from torchtune.rlhf import Trajectory
+
+# from torchtune.rlhf import Trajectory
 
 from torchtune.training import DummyProfiler, PROFILER_KEY
 from torchtune.training.lr_schedulers import get_lr
 
 from vllm import LLM, SamplingParams
+from vllm.outputs import CompletionOutput, RequestOutput
 from vllm.utils import get_ip, get_open_port
 from vllm.worker.worker import Worker
 
 log = utils.get_logger("DEBUG")
+import torch.nn.functional as F
+
+
+def pad_and_stack(tensors, pad_value=0):
+    """
+    Pads a list of tensors to the same shape and stacks them.
+
+    Args:
+        tensors (list of torch.Tensor): List of tensors to pad and stack.
+        pad_value (scalar): The value to pad with (default is 0).
+
+    Returns:
+        torch.Tensor: A tensor with shape (N, *max_dims) where each tensor is padded to max_dims.
+    """
+    # Assume all tensors have the same number of dimensions.
+    num_dims = tensors[0].dim()
+
+    # Compute the maximum size for each dimension.
+    max_shape = [max(t.size(d) for t in tensors) for d in range(num_dims)]
+
+    padded_tensors = []
+    for tensor in tensors:
+        # Build padding amounts for each dimension (pad on the right only).
+        # F.pad expects the padding tuple in reverse order: (pad_left_last_dim, pad_right_last_dim, ...).
+        pad = []
+        for dim in range(num_dims - 1, -1, -1):
+            pad_amount = max_shape[dim] - tensor.size(dim)
+            pad.extend([0, pad_amount])
+        padded = F.pad(tensor, pad, value=pad_value)
+        padded_tensors.append(padded)
+
+    return torch.stack(padded_tensors)
 
 
 class Trajectory(TensorClass["nocast"]):
@@ -94,6 +127,54 @@ class Trajectory(TensorClass["nocast"]):
     seq_lens: torch.Tensor
     answers: torch.Tensor
     policy_version: int
+
+
+class PaddedTrajectoryBatch(TensorClass["nocast"]):
+    """
+    These are only single-turn trajectories (prompt + response).
+    TODO design together what a multi-turn interaction looks like.
+    Not needed at this stage.
+    """
+
+    policy_model_id: int  # Fingerprints the policy model who wrote the response
+    prompts_str: str  # size is [batch]
+    responses_str: str  # size is [batch, grpo_size]
+
+    prompt_token_ids: torch.LongTensor  # [batch, max_prompt_len]
+    response_token_ids: torch.LongTensor  # [batch, grpo_size, max_response_len]
+
+    logprobs: torch.Tensor  # [batch, grpo_size, max_response_len]
+    ref_logprobs: torch.Tensor  # [batch, grpo_size, max_response_len]
+
+
+class PackedTrajectoryBatch(TensorClass["nocast"]):
+    """
+    These are only single-turn trajectories (prompt + response).
+    TODO design together what a multi-turn interaction looks like.
+    Not needed at this stage.
+    """
+
+    policy_model_id: int  # Fingerprints the policy model who wrote the response
+    prompts_str: str
+    responses_str: str
+
+    # TODO fix these later
+    # Legenda of sizes:
+    # B = batch size
+    # P[i] = prompt len for element i in batch
+    # R[i] = response len for element i in batch
+
+    packed_token_ids: torch.LongTensor  # sum(P[i] + R[i] for i in range(B))
+    packed_sequence_ids: (
+        torch.LongTensor
+    )  # size is same as packed_token_ids. Each value indicates what sequence they belong to, eg [1, 1, 1, 2, 2, 3, 3, 3, 3]
+    packed_loss_mask: (
+        torch.LongTensor
+    )  # size is the same as packed_token_ids. This mask disables loss for prompt/system tokens.
+
+    # TODO figure this out later. I assume we need to match packed_token_ids lens and have zero-padding for prompt tokens
+    packed_logprobs: torch.Tensor  # size is same as packed_token_ids. TODO check
+    ref_logprobs: torch.Tensor  # size is same as packed_token_ids. TODO check
 
 
 def stateless_init_process_group(
@@ -539,6 +620,94 @@ class vLLMRolloutActor:
 
         ray.get(self._metric_logger.log_dict.remote(log_dict, step=step_idx))
 
+    def vllm_to_trajectories(
+        self, request_outputs: List[RequestOutput]
+    ):  # -> PaddedTrajectoryBatch:
+        """
+        Convert vLLM RequestOutput to a PaddedTrajectoryBatch.
+
+        Args:
+            request_output: List of output from vLLM generation. Each item in the list is a list
+
+        Returns:
+            PaddedTrajectoryBatch: Structured batch of trajectories
+        """
+        batch_size = len(request_outputs)  # These are all different prompts
+
+        policy_model_id = self.policy_version
+        prompts_str = []
+        responses_str = []
+
+        prompt_tokens: List[torch.LongTensor] = []
+        response_tokens: List[List[torch.LongTensor]] = []
+        logprobs: List[List[torch.LongTensor]] = []
+
+        for grpo_batch in request_outputs:
+            assert len(grpo_batch.outputs) == self.grpo_samples
+            assert grpo_batch.prompt_token_ids is not None
+            prompts_str.extend(self._tokenizer.decode(grpo_batch.prompt_token_ids))
+            prompt_tokens.append(torch.LongTensor(grpo_batch.prompt_token_ids))
+            response_tokens.append([])
+            logprobs.append([])
+            for response in grpo_batch.outputs:
+                response_str = self._tokenizer.decode(response.token_ids)
+                responses_str.append(response_str)
+                response_tokens[-1].append(torch.LongTensor(response.token_ids))
+
+                if not response.logprobs:
+                    raise ValueError(
+                        "No logprobs found in response. Make sure you check VLLM config"
+                    )
+                # Extract logprobs
+                logprobs[-1].append(
+                    torch.LongTensor(
+                        [
+                            d[tok].logprob
+                            for tok, d in zip(response.token_ids, response.logprobs)
+                        ]
+                    )
+                )
+        padded_prompt_tokens = pad_and_stack(
+            prompt_tokens, pad_value=self._tokenizer.pad_id
+        )
+        padded_response_tokens = pad_and_stack(
+            response_tokens, pad_value=self._tokenizer.pad_id
+        )
+        padded_logprobs = pad_and_stack(logprobs, pad_value=0.0)
+
+        # TODO if the below is uncommented, VLLM doesn't start. The error is masked
+        # behind a CUDA allocation error so I don't know what's going on.
+        # The error is there even if this whole function is not used anywhere.
+
+        # trajectory_batch = PaddedTrajectoryBatch(
+        #     policy_model_id=self.policy_version,
+        #     prompts_str=prompts_str,
+        #     responses_str=responses_str,
+        #     prompt_tokens=padded_prompt_tokens,
+        #     response_tokens=padded_response_tokens,
+        #     logprobs=padded_logprobs,
+        #     # Initialize ref_logprobs as zeros - will be filled by RefActor
+        #     ref_logprobs=torch.zeros_like(padded_logprobs),
+        #     batch_size=batch_size,
+        # )
+        # print(f"Trajectory batch! {trajectory_batch}")
+        # return trajectory_batch
+        return [padded_prompt_tokens, padded_response_tokens, padded_logprobs]
+
+    # def compute_advantages(self, batch):
+    #     rewards_full, successes_full, reward_metadata = batched_rewards(
+    #         self._tokenizer, responses, answers, device=self._device
+    #     )
+
+    #     # B, G, num_funcs -> B, G
+    #     rewards_sum = rewards_full.sum(-1)
+
+    #     # advantage
+    #     advantages = (rewards_sum - rewards_sum.mean(1, keepdim=True)) / (
+    #         rewards_sum.std(1, keepdim=True) + 1e-4
+    #     )
+    #     advantages = advantages.reshape(batch_size * grpo_size)
+
     def rollout(self):
         sampling_params = SamplingParams(
             # FIXME: can just directly change n to grpo_size instead of repeating prompt grpo_size times
@@ -548,74 +717,6 @@ class vLLMRolloutActor:
             # nondeterministically returns more than 1??
             logprobs=1,
         )
-
-        def postprocess_vllm_request_output(request_output):
-            bs = len(request_output)
-            print(f"len req output: {bs}")
-            print(f"\n\nrequest_output\n\n{request_output}")
-            prompt_tokens = []
-            response_tokens = []
-            logprobs = []
-            prompt_tokens = request_output[0].prompt_token_ids
-            for output in request_output:
-                print(f"Len of outputs: {len(output.outputs)}")
-                assert len(output.outputs) == self.grpo_samples
-                # vllm doesn't return prompt as part of output so we need to add it back later
-                tokens = list(output.outputs[0].token_ids)
-                response_tokens.append(tokens)
-                # nondeterministically returns more than 1 logprob sometimes
-                logprobs.append(
-                    [
-                        d[tok].logprob
-                        for tok, d in zip(tokens, output.outputs[0].logprobs)
-                    ]
-                )
-
-            seq_lens = [len(t) for t in response_tokens]
-
-            max_seq_len = max(seq_lens)
-            # pad output tokens
-            response_tokens = [
-                t + [self._tokenizer.pad_id] * (max_seq_len - len(t))
-                for t in response_tokens
-            ]
-            responses = torch.tensor(response_tokens, dtype=torch.long, device="cuda")
-
-            # pad logprobs
-            logprobs = [t + [1.0] * (max_seq_len - len(t)) for t in logprobs]
-
-            logprobs = torch.tensor(logprobs, dtype=torch.float, device="cuda")
-
-            query_responses = torch.empty(
-                bs,
-                len(prompt_tokens) + max_seq_len,
-                dtype=torch.long,
-                device="cuda",
-            )
-            query_responses[:, : len(prompt_tokens)] = torch.tensor(
-                prompt_tokens, dtype=torch.long
-            )
-            query_responses[:, len(prompt_tokens) :] = torch.tensor(
-                response_tokens, dtype=torch.long
-            )
-
-            query_response_padding_masks = torch.ne(
-                query_responses, self._tokenizer.pad_id
-            )
-            # this is so weird that they're opposite lol
-            # response_padding_masks = torch.eq(responses, self._tokenizer.pad_id)
-
-            seq_lens = torch.tensor(seq_lens, dtype=torch.long, device="cuda")
-
-            # FIXME: change to Tensorclassy tensordict object
-            return [
-                query_responses,
-                responses,
-                logprobs,
-                # response_padding_masks,
-                query_response_padding_masks,
-                seq_lens,
-            ]
 
         for idx, batch in enumerate(self._dataloader):
             time_step_start = time.perf_counter()
@@ -661,7 +762,9 @@ class vLLMRolloutActor:
 
             time_generate = time.perf_counter() - time_generate_start
 
-            postprocessed_results = postprocess_vllm_request_output(result)
+            postprocessed_results = self.vllm_to_trajectories(result)
+
+            print("hereherehere")
 
             # Unpack to compute padded tokens percentage and tokens per second
             (
