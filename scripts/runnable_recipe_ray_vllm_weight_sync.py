@@ -49,7 +49,11 @@ from functools import partial
 from logging import log
 from re import S
 from typing import Any, Dict, List, Optional, Tuple, Union
+from unittest import result
 from warnings import warn
+
+from tensordict.tensorclass import NonTensorStack
+from torchrl.modules import vLLMWrapper
 
 import ray
 import torch
@@ -140,8 +144,8 @@ class PaddedTrajectoryBatch(TensorClass["nocast"]):
     prompts_str: str  # size is [batch]
     responses_str: str  # size is [batch, grpo_size]
 
-    prompt_token_ids: torch.LongTensor  # [batch, max_prompt_len]
-    response_token_ids: torch.LongTensor  # [batch, grpo_size, max_response_len]
+    prompt_tokens: torch.LongTensor  # [batch, max_prompt_len]
+    response_tokens: torch.LongTensor  # [batch, grpo_size, max_response_len]
 
     logprobs: torch.Tensor  # [batch, grpo_size, max_response_len]
     ref_logprobs: torch.Tensor  # [batch, grpo_size, max_response_len]
@@ -469,6 +473,7 @@ class vLLMRolloutActor:
 
         self.rollout_queue = queue
         self.llm = LLM(*args, **kwargs)
+
         from torchtune import config
 
         self._tokenizer = config.instantiate(self.cfg.tokenizer)
@@ -495,6 +500,14 @@ class vLLMRolloutActor:
         self.policy_version = 0
 
         self.metric_logger = None  # Placeholder for the logger
+        generate_kwargs = {
+            "n": self.grpo_samples,
+            "max_tokens": self._max_generated_tokens,
+            "temperature": self._temperature,
+            # nondeterministically returns more than 1??
+            # "logprobs": 1,
+        }
+        self.llm_wrapped = vLLMWrapper(self.llm, return_log_probs=True, generate_kwargs=generate_kwargs, pad_output=False, inplace=False, from_text=False)
 
     def set_metric_logger(self, logger):
         """Store the MetricLoggerActor handle."""
@@ -621,78 +634,35 @@ class vLLMRolloutActor:
         ray.get(self._metric_logger.log_dict.remote(log_dict, step=step_idx))
 
     def vllm_to_trajectories(
-        self, request_outputs: List[RequestOutput]
+        self, result: List[RequestOutput]
     ):  # -> PaddedTrajectoryBatch:
-        """
-        Convert vLLM RequestOutput to a PaddedTrajectoryBatch.
-
-        Args:
-            request_output: List of output from vLLM generation. Each item in the list is a list
-
-        Returns:
-            PaddedTrajectoryBatch: Structured batch of trajectories
-        """
-        batch_size = len(request_outputs)  # These are all different prompts
-
-        policy_model_id = self.policy_version
-        prompts_str = []
-        responses_str = []
-
-        prompt_tokens: List[torch.LongTensor] = []
-        response_tokens: List[List[torch.LongTensor]] = []
-        logprobs: List[List[torch.LongTensor]] = []
-
-        for grpo_batch in request_outputs:
-            assert len(grpo_batch.outputs) == self.grpo_samples
-            assert grpo_batch.prompt_token_ids is not None
-            prompts_str.extend(self._tokenizer.decode(grpo_batch.prompt_token_ids))
-            prompt_tokens.append(torch.LongTensor(grpo_batch.prompt_token_ids))
-            response_tokens.append([])
-            logprobs.append([])
-            for response in grpo_batch.outputs:
-                response_str = self._tokenizer.decode(response.token_ids)
-                responses_str.append(response_str)
-                response_tokens[-1].append(torch.LongTensor(response.token_ids))
-
-                if not response.logprobs:
-                    raise ValueError(
-                        "No logprobs found in response. Make sure you check VLLM config"
-                    )
-                # Extract logprobs
-                logprobs[-1].append(
-                    torch.LongTensor(
-                        [
-                            d[tok].logprob
-                            for tok, d in zip(response.token_ids, response.logprobs)
-                        ]
-                    )
-                )
+        prompts_str = result.get("prompts_str")
+        responses_str = result.get("prompts_str")
+        prompt_tokens = result.get("tokens", as_list=True)
+        response_tokens = result.get("tokens_response", as_list=True)
+        log_probs = result.get("log_probs", as_list=True)
+        # TODO: we can ask the wrapper to pad for us - do we want padding on the left or right?
         padded_prompt_tokens = pad_and_stack(
             prompt_tokens, pad_value=self._tokenizer.pad_id
         )
         padded_response_tokens = pad_and_stack(
             response_tokens, pad_value=self._tokenizer.pad_id
         )
-        padded_logprobs = pad_and_stack(logprobs, pad_value=0.0)
-
-        # TODO if the below is uncommented, VLLM doesn't start. The error is masked
-        # behind a CUDA allocation error so I don't know what's going on.
-        # The error is there even if this whole function is not used anywhere.
-
-        # trajectory_batch = PaddedTrajectoryBatch(
-        #     policy_model_id=self.policy_version,
-        #     prompts_str=prompts_str,
-        #     responses_str=responses_str,
-        #     prompt_tokens=padded_prompt_tokens,
-        #     response_tokens=padded_response_tokens,
-        #     logprobs=padded_logprobs,
-        #     # Initialize ref_logprobs as zeros - will be filled by RefActor
-        #     ref_logprobs=torch.zeros_like(padded_logprobs),
-        #     batch_size=batch_size,
-        # )
-        # print(f"Trajectory batch! {trajectory_batch}")
-        # return trajectory_batch
-        return [padded_prompt_tokens, padded_response_tokens, padded_logprobs]
+        padded_logprobs = pad_and_stack(log_probs, pad_value=0.0)
+        batch_size = result.batch_size
+        trajectory_batch = PaddedTrajectoryBatch(
+            policy_model_id=self.policy_version,
+            prompts_str=prompts_str,
+            responses_str=responses_str,
+            prompt_tokens=padded_prompt_tokens,
+            response_tokens=padded_response_tokens,
+            logprobs=padded_logprobs,
+            # Initialize ref_logprobs as zeros - will be filled by RefActor
+            ref_logprobs=torch.zeros_like(padded_logprobs),
+            batch_size=batch_size,
+        )
+        return
+        # return [padded_prompt_tokens, padded_response_tokens, padded_logprobs]
 
     # def compute_advantages(self, batch):
     #     rewards_full, successes_full, reward_metadata = batched_rewards(
@@ -709,15 +679,6 @@ class vLLMRolloutActor:
     #     advantages = advantages.reshape(batch_size * grpo_size)
 
     def rollout(self):
-        sampling_params = SamplingParams(
-            # FIXME: can just directly change n to grpo_size instead of repeating prompt grpo_size times
-            n=self.grpo_samples,
-            max_tokens=self._max_generated_tokens,
-            temperature=self._temperature,
-            # nondeterministically returns more than 1??
-            logprobs=1,
-        )
-
         for idx, batch in enumerate(self._dataloader):
             time_step_start = time.perf_counter()
 
@@ -742,7 +703,7 @@ class vLLMRolloutActor:
                 return
 
             # FIXME: tokens is currently on cpu, is this right?s
-            tokens, answers = batch["tokens"].numpy().tolist(), batch["answers"]
+            tokens, answers = batch["tokens"], batch["answers"]
             # A downside is they only seem to take in List[List[int]] and not torch.Tensor :(
             # batch_tokens = batch_tokens.numpy().tolist()
 
@@ -753,16 +714,24 @@ class vLLMRolloutActor:
 
             time_generate_start = time.perf_counter()
             # do the generation
-            result = self.llm.generate(
-                prompts=None,
-                prompt_token_ids=tokens,
-                sampling_params=sampling_params,
-                use_tqdm=False,
-            )
+            data = TensorDict(tokens=tokens, batch_size=len(tokens))
+            print('sending data to llm', data)
+            # Flatten the data since we have b x grpo_samples data
+            data = self.llm_wrapped(data).view(-1)
+            print('got data from llm', data)
+            # TODO: if we use from_text=True in the wrapper we get these values for free
+            data["prompts_str"] = NonTensorStack(*["" for _ in range(data.shape[0])])
+            data["response_str"] = NonTensorStack(*["" for _ in range(data.shape[0])])
+            # result = self.llm.generate(
+            #     prompts=None,
+            #     prompt_token_ids=tokens,
+            #     sampling_params=sampling_params,
+            #     use_tqdm=False,
+            # )
 
             time_generate = time.perf_counter() - time_generate_start
 
-            postprocessed_results = self.vllm_to_trajectories(result)
+            postprocessed_results = self.vllm_to_trajectories(data)
 
             print("hereherehere")
 
