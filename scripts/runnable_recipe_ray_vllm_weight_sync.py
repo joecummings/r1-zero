@@ -304,13 +304,15 @@ class RefActor:
             ) = trajectory
 
             context_length = query_responses.shape[1] - responses.shape[1]
-
+            print("got context_length")
             masks = generation.get_causal_mask_from_padding_mask(
                 query_response_padding_masks
             )
+            print("got masks")
             position_ids = generation.get_position_ids_from_padding_mask(
                 query_response_padding_masks
             )
+            print("got position_ids")
 
             # Reset GPU memory stats before model_running
             torch.cuda.reset_peak_memory_stats()
@@ -320,6 +322,7 @@ class RefActor:
                 ref_logits = self._ref_model(
                     query_responses, input_pos=position_ids, mask=masks
                 )
+            print("got ref logits")
             time_model_running = time.perf_counter() - time_grpo_steps_start
 
             ref_logits = rlhf.truncate_sequence_for_logprobs(ref_logits, context_length)
@@ -1772,6 +1775,7 @@ class vLLMParameterServer(vLLMRemoteWeightUpdaterBase):
         self.rank = int(os.environ["RANK"])
         self.world_size = int(os.environ["WORLD_SIZE"])
         assert self.rank == self.world_size - 1
+        print("before new_group in parameter server")
 
         # FIXME: why this hang even when I pass use_local_synchronization=False in the other one??
         # self.fsdp_group = torch.distributed.new_group(ranks=list(range(self.world_size - 1)))
@@ -2004,23 +2008,40 @@ class RayGRPORecipe:
     def train(self):
         # rollout_handles = [worker.rollout.remote() for worker in self.rollout_workers]
         # self.rollout_workers[0].print_me.remote("hello vllm worker, it's __main__")
-        for i, data in enumerate(self.collector):
-            # data = data.to_padded_tensor(0.0)
-            print(data)
-        
-            if i == 2:
-                break
-        return
         ref_handles = [worker.run.remote() for worker in self.ref_workers]
         worker_handles = [worker.train.remote() for worker in self.actor_workers]
 
-        # for i, data in enumerate(self.collector):
-        #     prompt_tokens = data["prompt_tokens"]
-        #     response_tokens = data["response_tokens"]
-        #     logprobs = data["logprobs"]
-        #     batch_size = data.batch_size
+        for i, data in enumerate(self.collector):
+            query_responses = data["next", "tokens"]
+            prompt_tokens = data["tokens"]
+            response_tokens = data["tokens_response"]
+            logprobs = data["log_probs"]
+            query_response_padding_masks = data["next", "attention_mask"]
+            answers = data["answer"]
+            
+            seq_lens = training.get_unmasked_sequence_lengths(query_response_padding_masks)
+            seq_lens = seq_lens - prompt_tokens.shape[-1]
+
+            postprocessed_results = (
+                query_responses,
+                response_tokens,
+                logprobs,
+                query_response_padding_masks,
+                seq_lens,
+                answers,
+                # FIXME: fix policy version
+                0,
+            )
 
 
+            while True:
+                try:
+                    self.rollout_queue.put_nowait(postprocessed_results)
+                    break
+                except QueueFull:
+                    self.rollout_queue.get()  # Remove the oldest item to make space
+                    # full_queue_data_discard += 1
+                    print(f"rollout queue full. Discarding data.")
 
 
         ray.get(rollout_handles + ref_handles + worker_handles)
