@@ -392,7 +392,7 @@ class RefActor:
                 batch_size=batch_size,
             )
 
-            print(f"LINE 391: {trajectory}")
+            print(f"RefActor PUTS: {trajectory}")
             # Move tensors to CPU before putting into the queue
             trajectory = trajectory.cpu()
 
@@ -1359,11 +1359,15 @@ class PyTorchActorModel:
                 log.info("waiting for replay buffer")
                 time.sleep(1.0)
 
+            raw_sample = self.replay_buffer.sample(batch_size=self.batch_size)
+            print(f"PyTorchActor samples: {raw_sample}")
+
             trajectory = self.replay_buffer.sample(batch_size=self.batch_size)[0].to(
                 self._device
             )
             time_waiting_buffer = time.perf_counter() - time_waiting_buffer_start
-            log.info(f"{self.rank=} got from queue traj {trajectory}")
+            if self._is_rank_zero:
+                log.info(f"{self.rank=} got from queue traj {trajectory}")
 
             # Prepare trajectory for optimization
             trajectory, context_length, metadata = self._prepare_trajectory(trajectory)
