@@ -304,15 +304,12 @@ class RefActor:
             ) = trajectory
 
             context_length = query_responses.shape[1] - responses.shape[1]
-            print("got context_length")
             masks = generation.get_causal_mask_from_padding_mask(
                 query_response_padding_masks
             )
-            print("got masks")
             position_ids = generation.get_position_ids_from_padding_mask(
                 query_response_padding_masks
             )
-            print("got position_ids")
 
             # Reset GPU memory stats before model_running
             torch.cuda.reset_peak_memory_stats()
@@ -322,7 +319,6 @@ class RefActor:
                 ref_logits = self._ref_model(
                     query_responses, input_pos=position_ids, mask=masks
                 )
-            print("got ref logits")
             time_model_running = time.perf_counter() - time_grpo_steps_start
 
             ref_logits = rlhf.truncate_sequence_for_logprobs(ref_logits, context_length)
@@ -820,11 +816,11 @@ def make_llm_env(cfg, rank, num_replicas):
     # )
     _tokenizer = AutoTokenizer.from_pretrained("Qwen/Qwen2.5-3B")
     _tokenizer.pad_token = _tokenizer.eos_token
-    _tokenizer.padding_side = "left"
+    _tokenizer.padding_side = "right"
     _dataloader = _setup_data(
         cfg.dataset,
         shuffle=cfg.shuffle,
-        batch_size=2,
+        batch_size=batch_size,
         # collate_fn=collate_name,
         rank=rank,
         num_replicas=num_replicas,
@@ -867,12 +863,12 @@ def make_policy(cfg):
     generate_kwargs = dict(
         n=1,
         max_tokens=cfg.max_generated_tokens,
-        temperature = cfg.temperature,
+        temperature=cfg.temperature,
     )
 
     tokenizer = AutoTokenizer.from_pretrained("Qwen/Qwen2.5-3B")
     tokenizer.pad_token = tokenizer.eos_token
-    tokenizer.padding_side = "left"
+    tokenizer.padding_side = "right"
 
     policy = from_vllm(
         inference_model, tokenizer=tokenizer, from_text=False, generate=True, return_log_probs=True, generate_kwargs=generate_kwargs
@@ -1068,7 +1064,9 @@ class PyTorchActorModel:
         
         t = torch.tensor([1], device='cuda')
         if self._is_rank_zero:
+            print("doing send")
             torch.distributed.send(t, dst=2)
+            print("done send")
 
         log.info("Done setup")
 
@@ -1592,42 +1590,28 @@ class PyTorchActorModel:
         self._profiler.stop()
 
     def register_parameter_server(self, parameter_server):
+        print("registering parameter_server")
         assert self._is_rank_zero
         self.parameter_server = parameter_server
 
-    def sync_weights(self, new_sd):
-        """Synchronize model weights with vLLM engines."""
-        self.policy_version += 1
-        if self._is_rank_zero:
-            # Convert to vLLM-compatible format
-            # FIXME: don't hardcode kwargs here
-            new_sd = qwen2_tune_to_hf(new_sd, num_heads=16, num_kv_heads=2, dim=2048)
-            param_list = [(k, v.dtype, v.shape) for k, v in new_sd.items()]
+    def sync_weights(self):
+        print("starting sync_weights")
+        new_sd = {}
+        for k, v in self._model.state_dict().items():
+            new_sd[k] = v.full_tensor()
+        new_sd = qwen2_tune_to_hf(new_sd, num_heads=16, num_kv_heads=2, dim=2048)
+        torch.save(new_sd, "sd_passed_by_trainer-1.pt")
+        print("done tune_to_hf")
+        if self.rank == 0:
+            ray.get(self.parameter_server.acquire_state_dict_lock.remote())
+            self.parameter_server.receive_from_trainer.remote()
+            for i, (k, v) in enumerate(new_sd.items()):
+                # dst is global rank, can switch to group_dst arg if not 2.5.1
+                torch.distributed.send(v, dst=self.world_size-1)
 
-            # Start weight update on vLLM workers (non-blocking)
-            vllm_update_refs = [
-                eng.start_weight_update.remote(param_list, self.policy_version)
-                for eng in self._vllm_engines
-            ]
+            ray.get(self.parameter_server.release_state_dict_lock.remote())
+            print("done broadcasting")
 
-            # Broadcast each parameter to vLLM workers
-            for k, v in new_sd.items():
-                self._model_update_group.broadcast(
-                    v, 0, stream=torch.cuda.current_stream()
-                )
-
-            # Wait for vLLM workers to finish updating
-            ray.get(vllm_update_refs)
-
-            # Wake up vLLM workers to resume rollouts
-            for eng in self._vllm_engines:
-                eng.wake_up.remote()
-        else:
-            # Non-zero training ranks don’t participate in vLLM weight sync
-            pass
-
-        torch.distributed.barrier(group=self.fsdp_group)
-        print("waking up", flush=True)
 
     def _prepare_trajectory(self, raw_trajectory):
         """Process raw trajectory, compute rewards, and prepare for optimization.
@@ -1790,8 +1774,8 @@ class vLLMParameterServer(vLLMRemoteWeightUpdaterBase):
         for k, v in self.state_dict.items():
             torch.distributed.recv(v, src=0)
 
-    def _skip_update(self, worker_id: int) -> bool:
-        pass
+    # def _skip_update(self, worker_id: int) -> bool:
+    #     pass
 
     def check_weights_changed(self):
         """
@@ -1823,11 +1807,11 @@ class RayGRPORecipe:
 
         # Create workers using config values directly
         # self.rollout_workers = self._create_vllm_workers()
-        self.collector = self._create_collector()
         self.ref_workers = self._create_ref_workers()
         self.actor_workers, self.param_server = self._create_fsdp_group_and_param_server(
             worker_cls=PyTorchActorModel, parameter_server_cls=vLLMParameterServer, fsdp_world_size=self.num_fsdp_workers, num_vllm_workers=self.num_vllm_workers
         )
+        self.collector = self._create_collector()
         # self._init_weight_sync_pg()
 
         # needs to happens after workers are created
@@ -1872,8 +1856,8 @@ class RayGRPORecipe:
             )
             fsdp_workers.append(worker)
         
-        vllm_addresses = [get_ip()] * num_vllm_workers
-        vllm_ports = [get_open_port() for i in range(num_vllm_workers)]
+        self.vllm_addresses = [get_ip()] * num_vllm_workers
+        self.vllm_ports = [get_open_port() for i in range(num_vllm_workers)]
 
         env_vars = {
             "RANK": str(fsdp_world_size),
@@ -1883,7 +1867,7 @@ class RayGRPORecipe:
         }
 
         # FIXME: refactor this to be a transformation on self.cfg.model
-        parameter_server = parameter_server_cls.remote("Qwen/Qwen2.5-3B", vllm_addresses, vllm_ports, env_vars)
+        parameter_server = parameter_server_cls.remote("Qwen/Qwen2.5-3B", self.vllm_addresses, self.vllm_ports, env_vars)
 
         fsdp_workers[0].register_parameter_server.remote(parameter_server)
         
@@ -1911,13 +1895,30 @@ class RayGRPORecipe:
             "num_gpus": self.cfg.vllm.tp_size,
             # "memory": 2 * 1024**3,
         }
+
+        vllm_addresses = self.vllm_addresses
+        vllm_ports = self.vllm_ports
+        model_metadata = ray.get(self.param_server.get_model_metadata.remote())
+        print(model_metadata)
+
+        local_weight_updaters = [
+            vLLMHFLocalWeightUpdater(vllm_master_address, vllm_update_port, model_metadata) for
+            vllm_master_address, vllm_update_port in zip(vllm_addresses, vllm_ports)
+        ]
+
         collector = RayCollector(
             [make_env_wrapper(rank) for rank in range(self.num_vllm_workers)],
             policy_factory=make_policy_wrapper,
-            frames_per_batch=1,
-            total_frames=200,
+            frames_per_batch=16, # FIXME: change this to batch_size * grpo_size
+            total_frames=10000,
             remote_configs=remote_configs,
-            num_collectors=4,
+            num_collectors=self.num_vllm_workers,
+            reset_at_each_iter=True,
+            update_after_each_batch=True,
+            remote_weight_updater=self.param_server,
+            collector_kwargs=[
+                {"local_weight_updater": updater} for updater in local_weight_updaters
+            ],
         )
         return collector
 
@@ -2006,21 +2007,33 @@ class RayGRPORecipe:
         ray.get(self.actor_workers[0].set_vllm_engines.remote(self.rollout_workers))
 
     def train(self):
+        from transformers import AutoTokenizer
+
+        tokenizer = AutoTokenizer.from_pretrained("Qwen/Qwen2.5-3B")
+        pad_id = tokenizer.pad_token_id
+        # del tokenizer
+
         # rollout_handles = [worker.rollout.remote() for worker in self.rollout_workers]
         # self.rollout_workers[0].print_me.remote("hello vllm worker, it's __main__")
         ref_handles = [worker.run.remote() for worker in self.ref_workers]
         worker_handles = [worker.train.remote() for worker in self.actor_workers]
+        
 
         for i, data in enumerate(self.collector):
+            data = data.squeeze()
             query_responses = data["next", "tokens"]
             prompt_tokens = data["tokens"]
             response_tokens = data["tokens_response"]
+            print(tokenizer.decode(data["tokens_response"][0]))
             logprobs = data["log_probs"]
-            query_response_padding_masks = data["next", "attention_mask"]
+            query_response_padding_masks = torch.ne(
+                query_responses, pad_id
+            )
             answers = data["answer"]
-            
-            seq_lens = training.get_unmasked_sequence_lengths(query_response_padding_masks)
-            seq_lens = seq_lens - prompt_tokens.shape[-1]
+
+            response_padding_masks = torch.eq(response_tokens, pad_id)
+            seq_lens = training.get_unmasked_sequence_lengths(response_padding_masks)
+            del response_padding_masks
 
             postprocessed_results = (
                 query_responses,
@@ -2033,7 +2046,6 @@ class RayGRPORecipe:
                 0,
             )
 
-
             while True:
                 try:
                     self.rollout_queue.put_nowait(postprocessed_results)
@@ -2044,7 +2056,7 @@ class RayGRPORecipe:
                     print(f"rollout queue full. Discarding data.")
 
 
-        ray.get(rollout_handles + ref_handles + worker_handles)
+        ray.get(ref_handles + worker_handles)
         ray.get(self.actor_workers[0].cleanup.remote())
 
     def stop_ray(self):
