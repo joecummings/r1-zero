@@ -63,7 +63,8 @@ from ray.util.placement_group import placement_group
 
 from ray.util.queue import Full as QueueFull, Queue
 from ray.util.scheduling_strategies import PlacementGroupSchedulingStrategy
-from tensordict import is_tensorclass, TensorClass
+
+from tensordict import is_tensorclass, NonTensorData, TensorClass, TensorDict
 
 from torch.distributed.device_mesh import init_device_mesh
 from torch.optim import Optimizer
@@ -97,6 +98,8 @@ class Trajectory(TensorClass["nocast"]):
     seq_lens: torch.Tensor
     answers: torch.Tensor
     policy_version: int
+    rewards: torch.Tensor
+    advantages: torch.Tensor
 
 
 def stateless_init_process_group(
@@ -274,39 +277,26 @@ class RefActor:
                     if self._is_actor_zero:
                         print(f"Getting from rollout_queue queue.")
                     trajectory = self.rollout_queue.get(timeout=0.5)
+                    trajectory = trajectory.to(self._device)
 
-                    # Move tensors back to GPU
-                    trajectory = [
-                        (
-                            tensor.to(self._device)
-                            if isinstance(tensor, torch.Tensor)
-                            else tensor
-                        )
-                        for tensor in trajectory
-                    ]
                 except ray.util.queue.Empty:
                     trajectory = None
                     time.sleep(0.1)
             time_wait_end = time.perf_counter()
             time_waiting_buffer = time_wait_end - time_step_start
 
-            (
-                query_responses,
-                responses,
-                logprobs,
-                query_response_padding_masks,
-                seq_lens,
-                answers,
-                policy_version,
-            ) = trajectory
+            print(f"got trajectory {trajectory} from rollout queue")
 
-            context_length = query_responses.shape[1] - responses.shape[1]
+            context_length = (
+                trajectory["query_responses"].shape[1]
+                - trajectory["responses"].shape[1]
+            )
 
             masks = generation.get_causal_mask_from_padding_mask(
-                query_response_padding_masks
+                trajectory["query_response_padding_masks"]
             )
             position_ids = generation.get_position_ids_from_padding_mask(
-                query_response_padding_masks
+                trajectory["query_response_padding_masks"]
             )
 
             # Reset GPU memory stats before model_running
@@ -315,29 +305,29 @@ class RefActor:
             time_grpo_steps_start = time.perf_counter()
             with torch.no_grad():
                 ref_logits = self._ref_model(
-                    query_responses, input_pos=position_ids, mask=masks
+                    trajectory["query_responses"], input_pos=position_ids, mask=masks
                 )
             time_model_running = time.perf_counter() - time_grpo_steps_start
 
             ref_logits = rlhf.truncate_sequence_for_logprobs(ref_logits, context_length)
             ref_logprobs = rlhf.batched_logits_to_logprobs(
-                ref_logits, responses, self._temperature
+                ref_logits, trajectory["responses"], self._temperature
             )
 
             del ref_logits, position_ids, masks
             # masking of ref_logprobs is done in grpo_step
 
             # Repack trajectory with policy_version
-            batch_size = logprobs.shape[:1] if logprobs.ndim > 1 else ()
+            batch_size = trajectory["query_responses"].shape[0]
             trajectory = Trajectory(
-                query_responses=query_responses,
-                responses=responses,
-                logprobs=logprobs,
+                query_responses=trajectory["query_responses"],
+                responses=trajectory["responses"],
+                logprobs=trajectory["logprobs"],
                 ref_logprobs=ref_logprobs,
-                query_response_padding_masks=query_response_padding_masks,
-                seq_lens=seq_lens,
-                answers=answers,
-                policy_version=policy_version,
+                query_response_padding_masks=trajectory["query_response_padding_masks"],
+                seq_lens=trajectory["seq_lens"],
+                answers=trajectory["answers"],
+                policy_version=trajectory["policy_version"],
                 batch_size=batch_size,
             )
             print(f"putting trajectory {trajectory} into actor queue")
@@ -608,14 +598,22 @@ class vLLMRolloutActor:
             seq_lens = torch.tensor(seq_lens, dtype=torch.long, device="cuda")
 
             # FIXME: change to Tensorclassy tensordict object
-            return [
-                query_responses,
-                responses,
-                logprobs,
-                # response_padding_masks,
-                query_response_padding_masks,
-                seq_lens,
-            ]
+            return TensorDict(
+                query_responses=query_responses,
+                responses=responses,
+                logprobs=logprobs,
+                query_response_padding_masks=query_response_padding_masks,
+                seq_lens=seq_lens,
+                batch_size=bs,
+            )
+            # return [
+            #     query_responses,
+            #     responses,
+            #     logprobs,
+            #     # response_padding_masks,
+            #     query_response_padding_masks,
+            #     seq_lens,
+            # ]
 
         for idx, batch in enumerate(self._dataloader):
             time_step_start = time.perf_counter()
@@ -662,29 +660,26 @@ class vLLMRolloutActor:
 
             postprocessed_results = postprocess_vllm_request_output(result)
 
+            print(f"Line 675. postprocessed_results: {postprocessed_results}")
+
             # Unpack to compute padded tokens percentage and tokens per second
-            (
-                query_responses,
-                responses,
-                logprobs,
-                query_response_padding_masks,
-                seq_lens,
-            ) = postprocessed_results
+            # (
+            #     query_responses,
+            #     responses,
+            #     logprobs,
+            #     query_response_padding_masks,
+            #     seq_lens,
+            # ) = postprocessed_results
             # Compute total generated tokens for tokens per second
-            total_generated_tokens = seq_lens.sum().item()
+            total_generated_tokens = postprocessed_results["seq_lens"].sum().item()
 
-            postprocessed_results.append(answers)
-            postprocessed_results.append(self.policy_version)
+            postprocessed_results["answers"] = answers
+            postprocessed_results["policy_version"] = NonTensorData(self.policy_version)
 
-            # print(self._tokenizer.decode(batch_tokens[0]))
-            # print("===")
-            # print(self._tokenizer.decode(postprocessed_results[0][0].cpu().numpy().tolist()))
+            print(f"Line 691. postprocessed_results: {postprocessed_results}")
 
             # Move tensors to CPU before putting into the queue
-            postprocessed_results = [
-                tensor.cpu() if isinstance(tensor, torch.Tensor) else tensor
-                for tensor in postprocessed_results
-            ]
+            postprocessed_results = postprocessed_results.to("cpu")
 
             # Update circular queue and count full queue tries
             # full_queue_data_discard = 0
