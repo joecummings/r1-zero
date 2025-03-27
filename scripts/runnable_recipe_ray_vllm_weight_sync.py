@@ -1593,16 +1593,27 @@ class PyTorchActorModel:
         print("registering parameter_server")
         assert self._is_rank_zero
         self.parameter_server = parameter_server
+    
+    def get_model_metadata(self):
+        from torch._subclasses.fake_tensor import FakeTensorMode
 
-    def sync_weights(self):
-        print("starting sync_weights")
-        new_sd = {}
-        for k, v in self._model.state_dict().items():
-            new_sd[k] = v.full_tensor()
-        new_sd = qwen2_tune_to_hf(new_sd, num_heads=16, num_kv_heads=2, dim=2048)
-        torch.save(new_sd, "sd_passed_by_trainer-1.pt")
-        print("done tune_to_hf")
-        if self.rank == 0:
+        fake_sd_metadata = {k: (v.shape, v.dtype) for k, v in self._model.state_dict().items()}
+        fake_sd = dict()
+        with FakeTensorMode():
+            for k, (shape, dtype) in fake_sd_metadata.items():
+                fake_sd[k] = torch.empty(shape, dtype=dtype, device='cuda')
+    
+        hf_fake_sd = qwen2_tune_to_hf(fake_sd, num_heads=16, num_kv_heads=2, dim=2048)
+
+        return {k: (v.dtype, v.shape) for k, v in hf_fake_sd.items()}
+
+    def sync_weights(self, new_sd):
+        # FIXME: add back policy version
+        # torch.save(new_sd, "sd_passed_by_trainer-1.pt")
+        if self._is_rank_zero:
+            print("starting sync_weights")
+            new_sd = qwen2_tune_to_hf(new_sd, num_heads=16, num_kv_heads=2, dim=2048)
+            print("done tune_to_hf")
             ray.get(self.parameter_server.acquire_state_dict_lock.remote())
             self.parameter_server.receive_from_trainer.remote()
             for i, (k, v) in enumerate(new_sd.items()):
@@ -1739,9 +1750,9 @@ class MetricLoggerActor:
 
 @ray.remote(num_cpus=1, num_gpus=1)
 class vLLMParameterServer(vLLMRemoteWeightUpdaterBase):
-    def __init__(self, model, vllm_master_address, vllm_master_port, env_vars):
+    def __init__(self, vllm_master_address, vllm_master_port, env_vars):
         print("in param server init")
-        super().__init__(model, vllm_master_address, vllm_master_port)
+        super().__init__(vllm_master_address, vllm_master_port)
         
         import os
         import torch
@@ -1867,9 +1878,11 @@ class RayGRPORecipe:
         }
 
         # FIXME: refactor this to be a transformation on self.cfg.model
-        parameter_server = parameter_server_cls.remote("Qwen/Qwen2.5-3B", self.vllm_addresses, self.vllm_ports, env_vars)
+        parameter_server = parameter_server_cls.remote(self.vllm_addresses, self.vllm_ports, env_vars)
 
         fsdp_workers[0].register_parameter_server.remote(parameter_server)
+        self.model_metadata = ray.get(fsdp_workers[0].get_model_metadata.remote())
+        ray.get(parameter_server.register_model_metadata.remote(self.model_metadata))
         
         return fsdp_workers, parameter_server
 
@@ -1898,19 +1911,19 @@ class RayGRPORecipe:
 
         vllm_addresses = self.vllm_addresses
         vllm_ports = self.vllm_ports
-        model_metadata = ray.get(self.param_server.get_model_metadata.remote())
-        print(model_metadata)
+        # model_metadata = ray.get(self.param_server.get_model_metadata.remote())
+        # print(model_metadata)
 
         local_weight_updaters = [
-            vLLMHFLocalWeightUpdater(vllm_master_address, vllm_update_port, model_metadata) for
+            vLLMHFLocalWeightUpdater(vllm_master_address, vllm_update_port, self.model_metadata) for
             vllm_master_address, vllm_update_port in zip(vllm_addresses, vllm_ports)
         ]
 
         collector = RayCollector(
             [make_env_wrapper(rank) for rank in range(self.num_vllm_workers)],
             policy_factory=make_policy_wrapper,
-            frames_per_batch=16, # FIXME: change this to batch_size * grpo_size
-            total_frames=10000,
+            frames_per_batch=self.cfg.batch_size * self.cfg.grpo_samples,
+            total_frames=100000,
             remote_configs=remote_configs,
             num_collectors=self.num_vllm_workers,
             reset_at_each_iter=True,
