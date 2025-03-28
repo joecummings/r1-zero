@@ -1227,7 +1227,6 @@ class PyTorchActorModel:
         self._profiler.stop()
 
     def register_parameter_server(self, parameter_server):
-        print("registering parameter_server")
         assert self._is_rank_zero
         self.parameter_server = parameter_server
     
@@ -1247,9 +1246,7 @@ class PyTorchActorModel:
     def sync_weights(self, new_sd):
         self.policy_version += 1
         if self._is_rank_zero:
-            print("starting sync_weights")
             new_sd = qwen2_tune_to_hf(new_sd, num_heads=16, num_kv_heads=2, dim=2048)
-            print("done tune_to_hf")
             ray.get(self.parameter_server.acquire_state_dict_lock.remote())
             self.parameter_server.receive_from_trainer.remote()
             for i, (k, v) in enumerate(new_sd.items()):
@@ -1257,7 +1254,6 @@ class PyTorchActorModel:
                 torch.distributed.send(v, dst=self.world_size-1)
 
             ray.get(self.parameter_server.release_state_dict_lock.remote())
-            print("done broadcasting")
 
 
     def _prepare_trajectory(self, raw_trajectory):
@@ -1410,19 +1406,11 @@ class vLLMParameterServer(vLLMRemoteWeightUpdaterBase):
 
         # FIXME: why this hang even when I pass use_local_synchronization=False in the other one??
         # self.fsdp_group = torch.distributed.new_group(ranks=list(range(self.world_size - 1)))
-        
-        t = torch.tensor([0], device='cuda')
-        torch.distributed.recv(t, src=0)
-        # assert t[0] == 1
-
-        print(f"done setting up parameter server {t[0]}")
     
     def receive_from_trainer(self):
         for k, v in self.state_dict.items():
             torch.distributed.recv(v, src=0)
 
-    # def _skip_update(self, worker_id: int) -> bool:
-    #     pass
 
     def check_weights_changed(self):
         """
