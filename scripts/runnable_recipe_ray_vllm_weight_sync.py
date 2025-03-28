@@ -698,12 +698,6 @@ class PyTorchActorModel:
         # Initialize policy version for tracking age of trajectories
         self.policy_version = 0
         self.metric_logger = None  # Placeholder for the logger
-        
-        t = torch.tensor([1], device='cuda')
-        if self._is_rank_zero:
-            print("doing send")
-            torch.distributed.send(t, dst=2)
-            print("done send")
 
         log.info("Done setup")
 
