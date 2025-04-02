@@ -81,6 +81,11 @@ def batched_rewards(
         batch_size, grpo_size, num_reward_funcs, dtype=torch.float32, device=device
     )
     metadata = {"func_names": [f.__name__ for f in reward_funcs]}
+
+    print(
+        f"batched_rewards: completions shape: {completions.shape}, batch_size: {batch_size}, grpo_size: {grpo_size}"
+    )
+
     for b in range(batch_size):
         for g in range(grpo_size):
             answer = answers[b][g]

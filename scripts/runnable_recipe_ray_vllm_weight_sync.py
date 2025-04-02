@@ -237,6 +237,7 @@ class RefActor:
         if not self._is_actor_zero:
             return
 
+        print(f"Logging step {step_idx}: rewards_mean={rewards_mean}")
         log_dict = {}
         if self._log_peak_memory_stats:
             memory_stats = training.get_memory_stats(device=self._device)
@@ -446,6 +447,34 @@ class RefActor:
 
             # End of step timing
             time_total_ref_step = time.perf_counter() - time_step_start
+
+            print(
+                f"Step {idx}: batch_size={self.cfg.vllm.batch_size}, grpo_samples={self.grpo_samples}"
+            )
+            print(f"Trajectory responses shape: {trajectory['responses'].shape}")
+
+            # Compute rewards
+            responses = responses.reshape(batch_size, group_size, -1)
+            print(f"Responses reshaped: {responses.shape}")
+            rewards_by_fn, successes_by_fn, reward_metadata = batched_rewards(
+                self._tokenizer, responses, answers, device=self._device
+            )
+            print(
+                f"rewards_by_fn shape: {rewards_by_fn.shape}, values sample: {rewards_by_fn[:2, :2]}"
+            )
+
+            # Compute group rewards and advantages
+            group_rewards = rewards_by_fn.sum(-1)
+            print(
+                f"group_rewards shape: {group_rewards.shape}, mean: {group_rewards.mean()}"
+            )
+
+            # Calculate mean rewards for logging
+            rewards_mean_per_func = rewards_by_fn.mean(dim=(0, 1)).cpu()
+            rewards_mean = rewards_mean_per_func.mean()
+            print(
+                f"rewards_mean_per_func: {rewards_mean_per_func}, rewards_mean: {rewards_mean}"
+            )
 
             # Calculate mean rewards and successes for logging
             rewards_mean_per_func = rewards_by_fn.mean(dim=(0, 1)).cpu()
@@ -772,6 +801,15 @@ class vLLMRolloutActor:
             time_generate = time.perf_counter() - time_generate_start
 
             postprocessed_results = postprocess_vllm_request_output(result)
+            print(
+                f"Step {idx}: batch_size={self.batch_size}, grpo_samples={self.grpo_samples}"
+            )
+            print(
+                f"Generated responses shape: {postprocessed_results['responses'].shape}"
+            )
+            print(
+                f"Sample response: {self._tokenizer.decode(postprocessed_results['responses'][0].tolist())}"
+            )
 
             total_generated_tokens = postprocessed_results["seq_lens"].sum().item()
 
