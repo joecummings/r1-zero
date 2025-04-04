@@ -669,7 +669,7 @@ class LLMCollector(SyncDataCollector):
         async_envs: bool = False,
         reset_at_each_iter: bool = False,
         local_weight_updater: LocalWeightUpdaterBase | None = None,
-        remote_weight_updater: RemoteWeightUpdaterBase | None = None,
+        # remote_weight_updater: RemoteWeightUpdaterBase | None = None,
     ):
         if async_envs:
             raise NotImplementedError
@@ -731,7 +731,6 @@ class LLMCollector(SyncDataCollector):
             frames_per_batch=dialog_turns_per_batch,
             total_frames=total_dialog_turns,
             local_weight_updater=local_weight_updater,
-            remote_weight_updater=remote_weight_updater,
             reset_at_each_iter=reset_at_each_iter,
             use_buffers=False,
             # This argument allows a non-TensorDictModule policy to be assumed
@@ -741,13 +740,13 @@ class LLMCollector(SyncDataCollector):
 
         log.info("done init LLMCollector")
 
-    @property
-    def remote_weight_updater(self) -> RemoteWeightUpdaterBase:
-        return self._remote_weight_updater
+    # @property
+    # def remote_weight_updater(self) -> RemoteWeightUpdaterBase:
+    #     return self._remote_weight_updater
 
-    @remote_weight_updater.setter
-    def remote_weight_updater(self, value: RemoteWeightUpdaterBase | None):
-        self._remote_weight_updater = value
+    # @remote_weight_updater.setter
+    # def remote_weight_updater(self, value: RemoteWeightUpdaterBase | None):
+    #     self._remote_weight_updater = value
 
     def _postprocess_for_queue(self, data):
         """
@@ -791,15 +790,6 @@ class LLMCollector(SyncDataCollector):
 
         total_generated_tokens = seq_lens.sum().item()
         return postprocessed_results, total_generated_tokens
-
-    def update_policy_weights_(
-        self,
-        policy_weights: TensorDictBase | None = None,
-        *,
-        worker_ids: int | list[int] | torch.device | list[torch.device] | None = None,
-        **kwargs,
-    ) -> None:
-        self.local_weight_updater(policy_weights, **kwargs)
 
     def set_metric_logger(self, logger):
         """Store the MetricLoggerActor handle."""
@@ -852,12 +842,13 @@ class LLMCollector(SyncDataCollector):
         for i in range(num_steps):
             self.rollout(i)
             if i % self.cfg.vllm.steps_before_sync == 0:
-                print(
-                    f"{self.worker_id} about to update weights, {self.remote_weight_updater}"
-                )
-                self.remote_weight_updater.update_weights.remote(
-                    weights=None, worker_ids=self.worker_id
-                )
+                self.update_policy_weights_()
+                # print(
+                #     f"{self.worker_id} about to update weights, {self.remote_weight_updater}"
+                # )
+                # self.remote_weight_updater.update_weights.remote(
+                #     weights=None, worker_ids=self.worker_id
+                # )
 
     def rollout(self, idx) -> TensorDictBase:
         if self.reset_at_each_iter or self._shuttle is None:
@@ -1805,11 +1796,13 @@ class MetricLoggerActor:
 
 
 class vLLMHFLocalWeightUpdater(LocalWeightUpdaterBase):
-    def __init__(self, master_address, master_port, model_metadata):
+    def __init__(self, master_address, master_port, model_metadata, param_server, worker_idx):
         self.master_address = master_address
         self.master_port = master_port
         self.model_metadata = model_metadata
         self.initialized_group = None
+        self.param_server = param_server
+        self.worker_idx = worker_idx
 
     def _get_server_weights(self):
         return None
@@ -1824,25 +1817,28 @@ class vLLMHFLocalWeightUpdater(LocalWeightUpdaterBase):
         return None
 
     def _update_local_weights(self, local_weights, mapped_weights):
-        inference_server = self.collector.inference_server
-        if self.initialized_group is None:
-            weight_sync_world_size = (
-                inference_server.llm_engine.parallel_config.tensor_parallel_size + 1
-            )
-            inference_server.collective_rpc(
-                "init_weight_update_group",
-                args=(self.master_address, self.master_port, 1, weight_sync_world_size),
-            )
-            self.initialized_group = True
+        should_update = not ray.get(self.param_server._skip_update.remote(self.worker_idx))
+        if should_update:
+            self.param_server._sync_weights_with_worker.remote(self.worker_idx)
+            inference_server = self.collector.inference_server
+            if self.initialized_group is None:
+                weight_sync_world_size = (
+                    inference_server.llm_engine.parallel_config.tensor_parallel_size + 1
+                )
+                inference_server.collective_rpc(
+                    "init_weight_update_group",
+                    args=(self.master_address, self.master_port, 1, weight_sync_world_size),
+                )
+                self.initialized_group = True
 
-        for k, (dtype, shape) in self.model_metadata.items():
-            inference_server.collective_rpc("update_weight", args=(k, dtype, shape))
+            for k, (dtype, shape) in self.model_metadata.items():
+                inference_server.collective_rpc("update_weight", args=(k, dtype, shape))
 
-        inference_server.collective_rpc("update_policy_version")
+            inference_server.collective_rpc("update_policy_version")
 
 
 @ray.remote(num_cpus=4, num_gpus=1)
-class vLLMParameterServer(RemoteWeightUpdaterBase):
+class vLLMParameterServer:
     def __init__(self, vllm_master_addresses, vllm_master_ports, env_vars):
         log.info("in param server init")
         super().__init__()
@@ -1900,11 +1896,6 @@ class vLLMParameterServer(RemoteWeightUpdaterBase):
     def all_worker_ids(self):
         return [i for i in range(len(self.collector._remote_collectors))]
 
-    def _get_server_weights(self):
-        return self.state_dict
-
-    def _maybe_map_weights(self, server_weights):
-        return server_weights
 
     def _skip_update(self, worker_id):
         if self.version == 0:
@@ -1932,9 +1923,10 @@ class vLLMParameterServer(RemoteWeightUpdaterBase):
         )
         self.vllm_comm_groups[worker_id] = model_update_group
 
-    def _sync_weights_with_worker(self, worker_id: int, server_weights):
+    def _sync_weights_with_worker(self, worker_id: int):
+        server_weights = self.state_dict
         log.info(f"in _sync_weights_with_worker {worker_id}")
-        self.vllm_worker_handles[worker_id].update_policy_weights_.remote()
+        # self.vllm_worker_handles[worker_id].update_policy_weights_.remote()
         if worker_id not in self.vllm_comm_groups:
             self._init_model_update_group(worker_id)
         read_lock = self.state_dict_lock.gen_rlock()
@@ -2096,9 +2088,9 @@ class RayGRPORecipe:
 
         local_weight_updaters = [
             vLLMHFLocalWeightUpdater(
-                vllm_master_address, vllm_update_port, self.model_metadata
+                vllm_master_address, vllm_update_port, self.model_metadata, self.param_server, idx
             )
-            for vllm_master_address, vllm_update_port in zip(vllm_addresses, vllm_ports)
+            for idx, (vllm_master_address, vllm_update_port) in enumerate(zip(vllm_addresses, vllm_ports))
         ]
 
         for i in range(self.num_vllm_workers):
@@ -2115,7 +2107,6 @@ class RayGRPORecipe:
                     reset_at_each_iter=True,
                     queue=self.rollout_queue,
                     local_weight_updater=local_weight_updaters[i],
-                    remote_weight_updater=self.param_server,
                 )
             )
             self.param_server.register_collector.remote(i, collector)
