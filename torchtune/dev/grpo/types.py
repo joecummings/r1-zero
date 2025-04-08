@@ -4,7 +4,7 @@
 # This source code is licensed under the BSD-style license found in the
 # LICENSE file in the root directory of this source tree.
 
-from typing import NamedTuple
+from typing import List, NamedTuple, Optional, Tuple
 
 import torch
 
@@ -24,6 +24,7 @@ class GRPOTrajectory(NamedTuple):
         position_ids (torch.Tensor): Position IDs for input ids-generated responses pairs with shape [B x G, P+L].
         response_padding_masks (torch.Tensor): Padding masks for the truncated and padded generated responses with shape [B x G, L].
         seq_lens (torch.Tensor): Sequence lengths of truncated generated responses.
+        pi_logprobs (torch.Tensor): Log probabilities of the generated responses using the current policy with shape [B x G, L].
     """
 
     query_responses: torch.Tensor = None  # [B x G, P+L]
@@ -34,6 +35,7 @@ class GRPOTrajectory(NamedTuple):
     position_ids: torch.Tensor = None  # [B x G, P+L]
     response_padding_masks: torch.Tensor = None  # [B x G, L]
     seq_lens: torch.Tensor = None
+    pi_logprobs: torch.Tensor = None  # [B x G, L]
 
 
 class GRPOStats(NamedTuple):
