@@ -400,7 +400,6 @@ class RefActor:
                 query_response_padding_masks
             )
             context_length = query_responses.shape[1] - responses.shape[1]
-            del query_response_padding_masks
 
             # Compute rewards
             responses = responses.reshape(batch_size, group_size, -1)
@@ -686,8 +685,8 @@ class LLMCollector(SyncDataCollector):
         self._tokenizer = config.instantiate(self.cfg.tokenizer)
         self.rollout_queue = queue
         self.worker_id = worker_id
-        self._sequence_counter = 0
         self._is_collector_zero = self.worker_id == 0
+        self._sequence_counter = 0  # Used to assign unique sequence IDs to each batch
 
         self.batch_size = self.cfg.vllm.batch_size
 
@@ -784,6 +783,8 @@ class LLMCollector(SyncDataCollector):
         del response_padding_masks
 
         # Generate unique sequence IDs for the batch
+        # FIXME: it outputs a List[List[str]] when sampling from replay buffer, with shape num_samples X 16.
+        # It should have shape num_samplesX1, so we can log a single sequence_id per sequence.
         batch_size = query_responses.shape[0]
         sequence_ids = NonTensorStack(
             *[
@@ -791,7 +792,8 @@ class LLMCollector(SyncDataCollector):
                 for i in range(batch_size)
             ]
         )
-        self._sequence_counter += batch_size  # Increment counter after assigning IDs
+        print("defined sequence_ids", sequence_ids)
+        self._sequence_counter += batch_size
 
         postprocessed_results = Trajectory(
             query_responses=query_responses,
@@ -1209,8 +1211,8 @@ class PyTorchActorModel:
         self.metric_logger = None  # Placeholder for the logger
 
         # Debugging configuration
-        self.debug_logging = cfg.get("debug_logging", True)
-        self.debug_num_samples_per_step = cfg.get("debug_num_samples_per_step", 16)
+        self.debug_logging_enabled = cfg.get("debug_logging_enabled", True)
+        self.debug_num_samples_per_step = cfg.get("debug_num_samples_per_step", 2)
 
         log.info("Done setup")
 
@@ -1409,7 +1411,7 @@ class PyTorchActorModel:
         self,
         trajectory: GRPOTrajectory,
         context_length: int,
-    ) -> tuple[GRPOStats, GRPOTrajectory | None]:
+    ) -> GRPOStats:
         """Perform a single GRPO optimization step over a batch of trajectories and corresponding advantages and returns.
 
         Args:
@@ -1417,9 +1419,7 @@ class PyTorchActorModel:
             context_length (int): the length of the context window
 
         Returns:
-            Tuple[GRPOStats, GRPOTrajectory|None]: A tuple containing an instance of :class:`~torchtune.rlhf.GRPOStats`
-                                            and the trajectory (updated with pi_logprobs if debug_logging is True,
-                                            otherwise the input trajectory)
+            GRPOStats: Instance of :class:`~torchtune.rlhf.GRPOStats`
         """
         # Create an output mask to avoid computing model.output on tokens we won't train
         # FIXME: when bsz>1, don't we have multiple context_length?
@@ -1457,6 +1457,11 @@ class PyTorchActorModel:
                 0.5 * ((pi_logprobs - trajectory.logprobs)[mask].pow(2)).mean()
             )
 
+        # Handle trajectory return based on debug mode
+        metadata = {}
+        if self.debug_logging_enabled:
+            metadata["pi_logprobs"] = pi_logprobs.detach()
+
         stats = GRPOStats(
             loss=loss,
             policy_loss=policy_loss,
@@ -1464,31 +1469,14 @@ class PyTorchActorModel:
             ratios=ratios,
             clipfrac=clipfrac,
             approx_policy_kls=approx_policy_kls,
+            metadata=metadata,
         )
 
-        # Handle trajectory return based on debug mode
-        if self.debug_logging:
-            # Create a new trajectory with updated pi_logprobs, detached and moved to CPU
-            updated_trajectory = GRPOTrajectory(
-                query_responses=trajectory.query_responses,
-                logprobs=trajectory.logprobs,
-                ref_logprobs=trajectory.ref_logprobs,
-                advantages=trajectory.advantages,
-                masks=trajectory.masks,
-                position_ids=trajectory.position_ids,
-                response_padding_masks=trajectory.response_padding_masks,
-                seq_lens=trajectory.seq_lens,
-                pi_logprobs=pi_logprobs.detach(),
-            )
-        else:
-            updated_trajectory = None
-            del pi_logprobs
-
-        del pi_logits
+        del pi_logits, pi_logprobs
         torch.cuda.empty_cache()  # TODO: Test if this is needed
         loss.backward()
 
-        return stats, updated_trajectory
+        return stats
 
     def set_vllm_engines(self, engines):
         """Set the vLLM engines for weight synchronization."""
@@ -1526,7 +1514,22 @@ class PyTorchActorModel:
         if not self._is_rank_zero:
             return
 
-        grpo_stats_stacked = GRPOStats(*map(torch.stack, zip(*grpo_stats)))
+        # Stack list[GRPOStats]
+        tensor_fields = [
+            "loss",
+            "policy_loss",
+            "kl_loss",
+            "ratios",
+            "clipfrac",
+            "approx_policy_kls",
+        ]
+        grpo_stats_stacked = GRPOStats(
+            **{
+                field: torch.stack([getattr(stats, field) for stats in grpo_stats])
+                for field in tensor_fields
+            }
+        )
+
         log_dict = {}
         if self._log_peak_memory_stats:
             memory_stats = training.get_memory_stats(device=self._device)
@@ -1596,7 +1599,7 @@ class PyTorchActorModel:
 
     def _log_debug_table(
         self,
-        trajectory: GRPOTrajectory,
+        grpo_trajectory: GRPOTrajectory,
         grpo_stats: GRPOStats,
         metadata: Dict[str, Any],
         context_length: int,
@@ -1607,39 +1610,58 @@ class PyTorchActorModel:
         ATTENTION: to see multiple tables in the logs check https://github.com/wandb/wandb/issues/6286#issuecomment-2734616342
 
         Args:
-            trajectory (GRPOTrajectory): Object containing sequence data (query_responses, logprobs, etc.).
+            grpo_trajectory (GRPOTrajectory): Object containing sequence data (query_responses, logprobs, etc.).
             grpo_stats (GRPOStats): Object with GRPO-related statistics (loss, policy_loss, etc.).
             metadata (Dict[str, Any]): Dictionary containing rewards, successes, policy_version, etc.
             context_length (int): Integer length of the prompt context.
         """
+
+        def _log_table(data: list, table_name: str) -> None:
+            """Helper function to log table data to WandB."""
+            if data:
+                log.info(f"Logging {table_name} for step {self._steps_run}")
+                columns = list(data[0].keys())
+                table_data = []
+                for row in data:
+                    table_data.append([row[col] for col in columns])
+                ray.get(
+                    self._metric_logger.log_table.remote(
+                        table_data, columns, table_name, step=self._steps_run
+                    )
+                )
+            else:
+                log.info(f"Failed to log {table_name} for step {self._steps_run}")
+
         # Determine the number of samples to log
         num_samples = min(
-            self.debug_num_samples_per_step, trajectory.query_responses.size(0)
+            self.debug_num_samples_per_step, grpo_trajectory.query_responses.size(0)
         )
 
         # Extract response tokens
-        targets = trajectory.query_responses[:, context_length:]
-
-        # Initialize
+        targets = grpo_trajectory.query_responses[:, context_length:]
         per_sample_table_data = []
         per_token_table_data = []
-        func_names = metadata["reward_metadata"][0]["func_names"]
-        query_response_padding_masks = metadata["query_response_padding_masks"]
-
-        print("sequence ids", metadata["sequence_ids"])
 
         # Iterate over each sample
         for idx in range(num_samples):
+            func_names = metadata["reward_metadata"][idx]["func_names"]
             sequence_id = metadata["sequence_ids"][idx]
-            seq_len = trajectory.seq_lens[idx].item()
+            seq_len = grpo_trajectory.seq_lens[idx].item()
 
-            # Decode prompt and response from token IDs
-            prompt_tokens = trajectory.query_responses[idx, :context_length].tolist()
-            response_tokens = trajectory.query_responses[idx, context_length:].tolist()
-            prompt = self._tokenizer.decode(prompt_tokens, skip_special_tokens=False)
-            response = self._tokenizer.decode(
-                response_tokens, skip_special_tokens=False
+            # Decode prompt and response once per sample
+            all_tokens = grpo_trajectory.query_responses[
+                idx, : context_length + seq_len
+            ].tolist()
+            decoded_sequence = self._tokenizer.decode(
+                all_tokens, skip_special_tokens=False
             )
+            prompt = decoded_sequence[:context_length]
+            response = decoded_sequence[context_length:]
+            response_tokens = targets[idx, :seq_len].tolist()
+            decoded_tokens = [
+                self._tokenizer.decode([token], skip_special_tokens=False)
+                for token in response_tokens
+            ]
 
             ### Per-Sample Data
             per_sample_dict = {}
@@ -1659,51 +1681,52 @@ class PyTorchActorModel:
                 per_sample_dict[f"success_{func_name}"] = success
 
             # Add GRPO statistics, handling per-sample vs. scalar cases
-            per_sample_dict["loss"] = (
-                grpo_stats.loss[idx].item()
-                if grpo_stats.loss.dim() > 0
-                else grpo_stats.loss.item()
-            )
-            per_sample_dict["policy_loss"] = (
-                grpo_stats.policy_loss[idx].item()
-                if grpo_stats.policy_loss.dim() > 0
-                else grpo_stats.policy_loss.item()
-            )
-            per_sample_dict["kl_loss"] = (
-                grpo_stats.kl_loss[idx].item()
-                if grpo_stats.kl_loss.dim() > 0
-                else grpo_stats.kl_loss.item()
-            )
-            per_sample_dict["ratios"] = (
-                grpo_stats.ratios[idx].mean().item()
-                if grpo_stats.ratios.dim() > 1
-                else grpo_stats.ratios.item()
-            )
-            per_sample_dict["clipfrac"] = (
-                grpo_stats.clipfrac[idx].item()
-                if grpo_stats.clipfrac.dim() > 0
-                else grpo_stats.clipfrac.item()
-            )
-            per_sample_dict["approx_policy_kls"] = (
-                grpo_stats.approx_policy_kls[idx].item()
-                if grpo_stats.approx_policy_kls.dim() > 0
-                else grpo_stats.approx_policy_kls.item()
-            )
+            stat_attrs = [
+                "loss",
+                "policy_loss",
+                "kl_loss",
+                "ratios",
+                "clipfrac",
+                "approx_policy_kls",
+            ]
+            for attr_name in stat_attrs:
+                stat = getattr(grpo_stats, attr_name)
+                per_sample_dict[attr_name] = (
+                    stat[idx].item() if stat.dim() > 0 else stat.item()
+                )
 
             # Add advantages
-            per_sample_dict["advantages"] = trajectory.advantages[idx].item()  # Added
+            per_sample_dict["advantages"] = grpo_trajectory.advantages[idx].item()
 
             # Add sequence metrics
             per_sample_dict["response_length"] = seq_len
             per_sample_dict["context_length"] = context_length
             per_sample_dict["has_stop_token"] = (
-                trajectory.response_padding_masks[idx].any().item()
+                grpo_trajectory.response_padding_masks[idx].any().item()
             )
 
-            # FIXME: revisit the masking logic
+            # Check if prompt tokens are included in loss (should be 0)
             per_sample_dict["prompt_masking_is_positive (should be 0)"] = (
-                ~query_response_padding_masks[idx, :context_length].sum().item()
+                grpo_trajectory.response_padding_masks[idx, :context_length]
+                .sum()
+                .item()
             )
+
+            # Check if tokens beyond seq_len are included in loss (should be 0)
+            if context_length + seq_len < grpo_trajectory.query_responses.shape[1]:
+                beyond_seq_len = (
+                    grpo_trajectory.response_padding_masks[
+                        idx, context_length + seq_len :
+                    ]
+                    .sum()
+                    .item()
+                )
+            else:
+                beyond_seq_len = 0
+            per_sample_dict["beyond_seq_len_masking_is_positive (should be 0)"] = (
+                beyond_seq_len
+            )
+
             per_sample_dict["num_tokens_response"] = seq_len
             per_sample_dict["step"] = self._steps_run
 
@@ -1716,51 +1739,29 @@ class PyTorchActorModel:
                 per_token_dict["Sequence ID"] = sequence_id
                 per_token_dict["Token Position"] = pos  # TODO: maybe remove?
                 per_token_dict["Token ID"] = targets[idx, pos].item()
-                per_token_dict["Decoded Token"] = self._tokenizer.decode(
-                    [targets[idx, pos].item()], skip_special_tokens=False
-                )
-                per_token_dict["generated_logprob"] = trajectory.logprobs[
+                per_token_dict["Decoded Token"] = decoded_tokens[pos]
+                per_token_dict["generated_logprob"] = grpo_trajectory.logprobs[
                     idx, pos
                 ].item()
-                per_token_dict["ref_logprob"] = trajectory.ref_logprobs[idx, pos].item()
-                per_token_dict["pi_logprob"] = trajectory.pi_logprobs[idx, pos].item()
+                per_token_dict["ref_logprob"] = grpo_trajectory.ref_logprobs[
+                    idx, pos
+                ].item()
+                per_token_dict["pi_logprob"] = (
+                    grpo_stats.metadata["pi_logprobs"][idx, pos].item()
+                    if grpo_stats.metadata
+                    else None
+                )
                 per_token_dict["mask"] = int(
-                    ~trajectory.response_padding_masks[idx, pos]
+                    ~grpo_trajectory.response_padding_masks[idx, pos]
                 )
                 per_token_dict["step"] = self._steps_run
 
-                # Append the dictionary to the per-token table data
+                # Append the dictionary
                 per_token_table_data.append(per_token_dict)
 
-        ### Log Per-Sample Table to WandB
-        if per_sample_table_data:
-            log.info(f"Logging per sample table data for step {self._steps_run}")
-            # Extract column names from the first dictionary
-            columns = list(per_sample_table_data[0].keys())
-            # Convert list of dictionaries to list of lists for WandB Table
-            data = [[row[col] for col in columns] for row in per_sample_table_data]
-            ray.get(
-                self._metric_logger.log_table.remote(
-                    data, columns, "per_sample_debug_table", step=self._steps_run
-                )
-            )
-        else:
-            log.info(f"Failed to log per sample table data for step {self._steps_run}")
-
-        ### Log Per-Token Table to WandB
-        if per_token_table_data:
-            log.info(f"Logging per token table data for step {self._steps_run}")
-            # Extract column names from the first dictionary
-            columns = list(per_token_table_data[0].keys())
-            # Convert list of dictionaries to list of lists for WandB Table
-            data = [[row[col] for col in columns] for row in per_token_table_data]
-            ray.get(
-                self._metric_logger.log_table.remote(
-                    data, columns, "per_token_debug_table", step=self._steps_run
-                )
-            )
-        else:
-            log.info(f"Failed to log per token table data for step {self._steps_run}")
+        # Log tables to WandB
+        _log_table(per_sample_table_data, "per_sample_debug_table")
+        _log_table(per_token_table_data, "per_token_debug_table")
 
     def train(self):
         """Execute the GRPO training loop."""
@@ -1797,21 +1798,20 @@ class PyTorchActorModel:
                 log.info(f"{self.rank=} got from queue traj {trajectory}")
 
             # Prepare trajectory for optimization
-            trajectory, context_length, metadata = self._prepare_trajectory(trajectory)
+            prepared_trajectory, context_length, metadata = self._prepare_trajectory(
+                trajectory
+            )
 
             # Perform GRPO optimization
             time_grpo_steps_start = time.perf_counter()
             grpo_stats: list[GRPOStats] = []
-            maybe_updated_trajectories = []
             for _ in range(self._ppo_epochs):
                 # step
-                step_stats, maybe_updated_trajectory = self.grpo_step(
-                    trajectory,
+                step_stats = self.grpo_step(
+                    prepared_trajectory,
                     context_length,
                 )
                 grpo_stats.append(step_stats)
-                maybe_updated_trajectories.append(maybe_updated_trajectory)
-
                 # grad norm
                 if self._clip_grad_norm is not None:
                     grad_norm = torch.nn.utils.clip_grad_norm_(
@@ -1834,10 +1834,13 @@ class PyTorchActorModel:
             self._steps_run += 1
 
             # Log debug table if enabled, using pi_logprobs from the first epoch
-            if self.debug_logging and self._is_rank_zero:
-                trajectory = maybe_updated_trajectories[0]
+            if (
+                self.debug_logging_enabled
+                and self._is_rank_zero
+                and self._steps_run % self._log_every_n_steps == 0
+            ):
                 self._log_debug_table(
-                    trajectory, grpo_stats[0], metadata, context_length
+                    prepared_trajectory, grpo_stats[0], metadata, context_length
                 )
 
             # Synchronize weights
@@ -1861,14 +1864,11 @@ class PyTorchActorModel:
 
             # Log metrics
             total_step_time = time.perf_counter() - time_step_start
-            avg_policy_age = self.policy_version - (
-                sum(metadata["policy_version"]) / len(metadata["policy_version"])
-            )
             if self._is_rank_zero:
                 log.info("logging metrics")
                 self._log_metrics(
                     step_idx=self.global_step,
-                    trajectory=trajectory,
+                    trajectory=prepared_trajectory,
                     grpo_stats=grpo_stats,
                     total_step_time=total_step_time,
                     time_grpo_steps=time_grpo_steps,
@@ -1877,7 +1877,7 @@ class PyTorchActorModel:
                     time_weight_gather=time_weight_gather,
                     number_of_tokens=metadata["number_of_tokens"],
                     padded_tokens_percentage=metadata["padded_tokens_percentage"],
-                    policy_age=avg_policy_age,
+                    policy_age=metadata["avg_policy_age"],
                     train_replay_buffer_size=train_replay_buffer_size,
                 )
                 log.info("done logging metrics")
@@ -1942,7 +1942,7 @@ class PyTorchActorModel:
         Returns:
             trajectory (GRPOTrajectory): Processed trajectory for GRPO optimization.
             context_length (int): Length of the context sequence.
-            metadata (dict): Metadata for logging, including rewards and performance metrics.
+            metadata (dict): Metadata for logging
         """
         # Extract components from raw trajectory
         query_responses = raw_trajectory.query_responses
@@ -1951,12 +1951,7 @@ class PyTorchActorModel:
         ref_logprobs = raw_trajectory.ref_logprobs
         query_response_padding_masks = raw_trajectory.query_response_padding_masks
         seq_lens = raw_trajectory.seq_lens
-        answers = raw_trajectory.answers
-        policy_version = raw_trajectory.policy_version
-        rewards = raw_trajectory.rewards
         advantages = raw_trajectory.advantages
-        successes = raw_trajectory.successes
-        reward_metadata = raw_trajectory.reward_metadata
 
         # Compute padded tokens percentage
         total_tokens = query_responses.numel()
@@ -1984,7 +1979,7 @@ class PyTorchActorModel:
         del query_response_padding_masks
 
         # Create GRPOTrajectory
-        trajectory = GRPOTrajectory(
+        prepared_trajectory = GRPOTrajectory(
             query_responses=query_responses,
             logprobs=logprobs,
             ref_logprobs=ref_logprobs,
@@ -1996,18 +1991,26 @@ class PyTorchActorModel:
         )
 
         # Metadata for logging
+        if isinstance(raw_trajectory.policy_version, list):
+            avg_policy_age = self.policy_version - (
+                sum(raw_trajectory.policy_version) / len(raw_trajectory.policy_version)
+            )
+        else:
+            avg_policy_age = self.policy_version - raw_trajectory.policy_version
+
         metadata = {
             "padded_tokens_percentage": padded_tokens_percentage,
             "number_of_tokens": number_of_tokens,
-            "policy_version": policy_version,
-            "reward_metadata": reward_metadata,
+            "avg_policy_age": avg_policy_age,
+            "sequence_ids": raw_trajectory.sequence_ids,
+            "policy_version": raw_trajectory.policy_version,
             "rewards": raw_trajectory.rewards,
             "successes": raw_trajectory.successes,
+            "reward_metadata": raw_trajectory.reward_metadata,
             "query_response_padding_masks": raw_trajectory.query_response_padding_masks,
-            "sequence_ids": raw_trajectory.sequence_ids,
         }
 
-        return trajectory, context_length, metadata
+        return prepared_trajectory, context_length, metadata
 
     def cleanup(self) -> None:
         """Close the metric logger on rank zero."""
