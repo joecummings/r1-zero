@@ -1687,7 +1687,7 @@ class PyTorchActorModel:
                 per_sample_dict[f"success_{func_name}"] = success
 
             # Add GRPO statistics, handling per-sample vs. scalar cases
-            # FIXME: currently has one scalar per batch. We should enable a scalar per sentence.
+            # TODO: currently has one scalar per batch. We should enable a scalar per sentence.
             # Need to refactor loss reduction to enable that.
             stat_attrs = [
                 "loss",
