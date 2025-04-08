@@ -1613,7 +1613,9 @@ class PyTorchActorModel:
         """
         Log debugging tables to WandB with per-token and per-sample features using dictionaries.
 
-        ATTENTION: to see multiple tables in the logs check https://github.com/wandb/wandb/issues/6286#issuecomment-2734616342
+        ATTENTION:
+        - To see multiple tables in the logs check https://github.com/wandb/wandb/issues/6286#issuecomment-2734616342
+        - To visualize the columns in wandb, click on 'Columns' in the bottom right, then add them to the graph."
 
         Args:
             grpo_trajectory (GRPOTrajectory): Object containing sequence data (query_responses, logprobs, etc.).
@@ -1758,6 +1760,12 @@ class PyTorchActorModel:
                     grpo_stats.metadata["pi_logprobs"][idx, pos].item()
                     if grpo_stats.metadata
                     else None
+                )
+                per_token_dict["abs_diff_pi_ref_logprob"] = abs(
+                    per_token_dict["pi_logprob"] - per_token_dict["ref_logprob"]
+                )
+                per_token_dict["abs_diff_pi_generated_logprob"] = abs(
+                    per_token_dict["pi_logprob"] - per_token_dict["generated_logprob"]
                 )
                 per_token_dict["mask"] = int(
                     ~grpo_trajectory.response_padding_masks[idx, pos]
