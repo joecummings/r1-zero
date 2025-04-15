@@ -3,7 +3,7 @@
 #
 # This config assumes that you've run the following command before launching
 # this run:
-#   tune download meta-llama/Llama-3.2-3B --output-dir /tmp/Llama-3.2-3B --ignore-patterns "original/consolidated.00.pth"
+#   tune download Qwen/Qwen2.5-3B-Instruct --output-dir /tmp/Qwen2.5-3B-Instruct
 #
 # It can be beneficial to first train the base model with SFT using the 3B_sft recipe.
 #
@@ -21,16 +21,16 @@
 #  sbatch multinode_grpo.sbatch
 
 name: grpo_qwen3b
-total_inference_batch_size: ${eval:'${vllm.batch_size} * ${grpo_samples}'}
+total_inference_batch_size: ${eval:'${vllm.batch_size} * ${grpo_samples}'} # total number of samples generated per inference step by the vLLM
 
 output_dir: /tmp/checkpoints/${name}
-base_model_path: /tmp/Qwen2.5-3B  # Use this to train from the slightly trained SFT model
+base_model_path: /tmp/Qwen2.5-3B-Instruct  # Use this to train from the slightly trained SFT model
 
 # Tokenizer
 tokenizer:
   _component_: torchtune.models.qwen2_5.qwen2_5_tokenizer
-  path: /tmp/Qwen2.5-3B/vocab.json
-  merges_file: /tmp/Qwen2.5-3B/merges.txt
+  path: ${base_model_path}/vocab.json
+  merges_file: ${base_model_path}/merges.txt
   max_seq_len: 1024
 
 # Dataset
@@ -72,12 +72,13 @@ resume_from_checkpoint: False
 save_every_n_epochs: 1
 
 # Fine-tuning arguments
-batch_size: 16
-grpo_samples: 16
+batch_size: 32 # how many samples are sampled from the replay_buffer by PyTorchActorModel
+grpo_samples: 16 # used in LLMCollector, RefActor, and PyTorchActorModel
 max_generated_tokens: 512
 top_k: null
 temperature: 1.0
-replay_buffer_size: ${total_inference_batch_size}  # TODO this needs to be fixed. Right now this can't be bigger, or else we'll get padding issues
+# TODO this needs to be fixed. Right now this can't be bigger, or else we'll get padding issues
+replay_buffer_size: ${batch_size} # Used by PyTorchActorModel
 
 ppo_epochs: 1
 
@@ -117,7 +118,7 @@ num_fsdp_workers: 2
 vllm:
   num_workers: 4
   tp_size: 1
-  batch_size: 1
+  batch_size: 1 # number of unique prompts per batch. Use `grpo_samples` to control repeats
   steps_before_sync: 1
   queue_maxsize: ${eval:'${vllm.num_workers} * ${steps_before_sync}'}
 

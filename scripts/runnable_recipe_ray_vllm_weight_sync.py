@@ -289,13 +289,13 @@ class RefActor:
 
         # Per-function rewards and successes
         for func_name, func_mean in zip(function_names, rewards_mean_per_func):
-            log_dict[
-                f"ref_actor_rewards/rewards_func_{func_name}_mean"
-            ] = func_mean.item()
+            log_dict[f"ref_actor_rewards/rewards_func_{func_name}_mean"] = (
+                func_mean.item()
+            )
         for func_name, func_mean in zip(function_names, successes_mean_per_func):
-            log_dict[
-                f"ref_actor_rewards/successes_func_{func_name}_mean"
-            ] = func_mean.item()
+            log_dict[f"ref_actor_rewards/successes_func_{func_name}_mean"] = (
+                func_mean.item()
+            )
 
         ray.get(self._metric_logger.log_dict.remote(log_dict, step=step_idx))
 
@@ -387,16 +387,6 @@ class RefActor:
                 self._tokenizer.pad_id,
             )
 
-            # Generate masks and position IDs
-            masks = generation.get_causal_mask_from_padding_mask(
-                query_response_padding_masks
-            )
-            position_ids = generation.get_position_ids_from_padding_mask(
-                query_response_padding_masks
-            )
-            context_length = query_responses.shape[1] - responses.shape[1]
-            del query_response_padding_masks
-
             # Compute rewards
             responses = responses.reshape(batch_size, group_size, -1)
             rewards_by_fn, successes_by_fn, reward_metadata = batched_rewards(
@@ -413,7 +403,6 @@ class RefActor:
             )  # (B, G)
 
             # Repack trajectory with policy_version
-
             trajectory = Trajectory(
                 query_responses=trajectory.query_responses,
                 responses=trajectory.responses,
@@ -1182,6 +1171,9 @@ class PyTorchActorModel:
             self._model.set_num_output_chunks(self._loss_fn.num_output_chunks)
 
         self._tokenizer = config.instantiate(self.cfg.tokenizer)
+        print(
+            f"pad_id: {self._tokenizer.pad_id}, token 4607: {self._tokenizer.decode([4607])}, token 21388: {self._tokenizer.decode([21388])}"
+        )
 
         # FIXME: need to get _steps_per_epoch when dataloader is no longer per fsdp worker but instead wrapped in vLLM
         # self._lr_scheduler = self._setup_lr_scheduler(
@@ -1436,6 +1428,7 @@ class PyTorchActorModel:
             targets=targets,
             ref_logprobs=trajectory.ref_logprobs,
             advantages=trajectory.advantages,
+            old_logprobs=trajectory.logprobs,
             padding_masks=~trajectory.response_padding_masks,
         )
 
@@ -1587,7 +1580,7 @@ class PyTorchActorModel:
             if self._is_rank_zero:
                 train_replay_buffer_size = len(self.replay_buffer)
 
-            while not len(self.replay_buffer):
+            while len(self.replay_buffer) < self.batch_size:
                 log.info("waiting for replay buffer")
                 time.sleep(1.0)
 
@@ -1624,10 +1617,10 @@ class PyTorchActorModel:
                 self._optimizer.zero_grad(set_to_none=True)
 
                 # scheduler
-                self.global_step += 1
                 if self._lr_scheduler is not None:
                     self._lr_scheduler.step()
 
+                self.global_step += 1
             log.info(f"{self.rank=} finished step {self._steps_run}")
             time_grpo_steps = time.perf_counter() - time_grpo_steps_start
             self._steps_run += 1
@@ -1657,9 +1650,9 @@ class PyTorchActorModel:
                 sum(metadata["policy_version"]) / len(metadata["policy_version"])
             )
             if self._is_rank_zero:
-                log.info("logging metrics")
+                log.info(f"logging metrics at step {self._steps_run}")
                 self._log_metrics(
-                    step_idx=self.global_step,
+                    step_idx=self._steps_run,
                     trajectory=trajectory,
                     grpo_stats=grpo_stats,
                     total_step_time=total_step_time,
@@ -1724,29 +1717,62 @@ class PyTorchActorModel:
             ray.get(self.parameter_server.release_state_dict_lock.remote())
 
     def _prepare_trajectory(self, raw_trajectory):
-        """Process raw trajectory, compute rewards, and prepare for optimization.
+        """Process raw trajectory and prepare it for optimization.
 
         Args:
-            raw_trajectory: The trajectory sampled from the replay buffer.
+            raw_trajectory: The trajectory sampled from the replay buffer (Trajectory object).
 
         Returns:
-            trajectory (GRPOTrajectory): Processed trajectory for GRPO optimization.
-            context_length (int): Length of the context sequence.
-            metadata (dict): Metadata for logging, including rewards and performance metrics.
+            trajectory: Processed trajectory for optimization (GRPOTrajectory).
+            context_length: Length of the context sequence (int).
+            metadata: Dict with logging info like padded token stats.
         """
-        # Extract components from raw trajectory
-        query_responses = raw_trajectory.query_responses
-        responses = raw_trajectory.responses
-        logprobs = raw_trajectory.logprobs
-        ref_logprobs = raw_trajectory.ref_logprobs
-        query_response_padding_masks = raw_trajectory.query_response_padding_masks
-        seq_lens = raw_trajectory.seq_lens
-        answers = raw_trajectory.answers
-        policy_version = raw_trajectory.policy_version
-        rewards = raw_trajectory.rewards
-        advantages = raw_trajectory.advantages
-        successes = raw_trajectory.successes
+
+        # Define padding values for different keys
+        padding_values = {
+            "query_responses": self._tokenizer.pad_id,  # Token sequences
+            "responses": self._tokenizer.pad_id,  # Token sequences
+            "logprobs": 0.0,  # Probabilities
+            "ref_logprobs": 0.0,  # Probabilities
+            "query_response_padding_masks": False,  # False means we will multiply by 0
+        }
+        log.info(f"Padding values: {padding_values}")
+
+        # Keys that need padding (sequence tensors)
+        sequence_keys = list(padding_values.keys())
+        log.info(f"Sequence keys: {sequence_keys}")
+
+        # Fetch data from raw_trajectory
+        trajectory_data = {}
+        for key in raw_trajectory.keys():
+            if key in sequence_keys:
+                # Get padded tensor for sequence keys
+                padded_tensor = raw_trajectory.get(
+                    key,
+                    as_padded_tensor=True,
+                    padding_value=padding_values[key],
+                    padding_side="left",
+                )
+                trajectory_data[key] = padded_tensor
+                log.info(f"Padded '{key}' to shape {padded_tensor.shape}")
+            else:
+                # Non-sequence keys (scalars, metadata, etc.)—no padding
+                trajectory_data[key] = raw_trajectory.get(key)
+                if isinstance(trajectory_data[key], torch.Tensor):
+                    log.info(f"Got '{key}' with shape {trajectory_data[key].shape}")
+                else:
+                    log.info(f"Got '{key}' as {type(trajectory_data[key])}")
+
+        # Pull out the pieces we need
+        query_responses = trajectory_data["query_responses"]
+        responses = trajectory_data["responses"]
+        logprobs = trajectory_data["logprobs"]
+        ref_logprobs = trajectory_data["ref_logprobs"]
+        query_response_padding_masks = trajectory_data["query_response_padding_masks"]
+        seq_lens = trajectory_data["seq_lens"]  # No padding needed
+        advantages = trajectory_data["advantages"]  # No padding needed
         reward_metadata = raw_trajectory.reward_metadata
+        policy_version = raw_trajectory.policy_version
 
         # Compute padded tokens percentage
         total_tokens = query_responses.numel()
@@ -1784,6 +1810,11 @@ class PyTorchActorModel:
             response_padding_masks=response_padding_masks,
             seq_lens=training.get_unmasked_sequence_lengths(response_padding_masks),
         )
+
+        for response in query_responses:
+            print("----")
+            log.info(f"query response: {response[:5]}")
+            log.info(f"{self._tokenizer.decode(response.tolist()[:5])}")
 
         # Metadata for logging
         metadata = {
@@ -1984,6 +2015,10 @@ class RayGRPORecipe:
             actor_options={"num_cpus": 10, "num_gpus": 0},
             maxsize=self.cfg.vllm.queue_maxsize,
         )
+
+        assert (
+            cfg.replay_buffer_size >= cfg.batch_size
+        ), f"Found {cfg.replay_buffer_size=} < {cfg.batch_size=}."
         self.replay_buffer = RayReplayBuffer(
             storage=functools.partial(
                 LazyStackStorage, max_size=cfg.replay_buffer_size

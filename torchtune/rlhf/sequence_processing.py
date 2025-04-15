@@ -118,21 +118,20 @@ def batched_logits_to_logprobs(
     Returns:
         torch.Tensor: The log probabilities corresponding to each token in ``sequences``. Shape [b, response_length].
     """
-    batch_size = logits.shape[0]
-    result = torch.empty_like(sequences, dtype=torch.float32, device=logits.device)
+    batch_size, seq_len, vocab_size = logits.shape
+    result = torch.empty(batch_size, seq_len, dtype=torch.float32, device=logits.device)
 
     for chunk_start in range(0, batch_size, chunk_size):
         chunk_end = min(chunk_start + chunk_size, batch_size)
-
-        # Process log_softmax for this batch chunk
-        chunk_log_probs = F.log_softmax(
-            logits[chunk_start:chunk_end] / temperature, dim=-1
-        )
-
-        # Gather for this chunk
-        result[chunk_start:chunk_end] = torch.gather(
-            chunk_log_probs, 2, sequences[chunk_start:chunk_end].unsqueeze(-1)
-        ).squeeze(-1)
+        logits_chunk = logits[chunk_start:chunk_end].reshape(
+            -1, vocab_size
+        )  # [chunk_size * seq_len, vocab_size]
+        sequences_chunk = sequences[chunk_start:chunk_end].reshape(
+            -1
+        )  # [chunk_size * seq_len]
+        result[chunk_start:chunk_end] = -F.cross_entropy(
+            logits_chunk, sequences_chunk, reduction="none"
+        ).reshape(chunk_end - chunk_start, seq_len)
 
     return result
 
@@ -191,5 +190,6 @@ def truncate_sequence_for_logprobs(
         context_length (int): The length of the context.
 
     Returns:
-        torch.Tensor: The truncated logits for the response with shape [b, response_length, vocab_size]."""
+        torch.Tensor: The truncated logits for the response with shape [b, response_length, vocab_size].
+    """
     return query_response_logits[:, context_length - 1 : -1]

@@ -6,10 +6,14 @@
 
 from typing import Optional, Tuple
 
+# Add detailed logging
 import torch
 import torch.nn as nn
 from torchtune import rlhf
 from torchtune.rlhf import masked_sum
+from torchtune.utils import get_logger
+
+log = get_logger("DEBUG")
 
 
 class GRPOLoss(nn.Module):
@@ -287,52 +291,105 @@ class GRPOWithChunkedOutputLoss(nn.Module):
         num_output_chunks (int): Number of chunks to split the sequence into. If 0, expects non-chunked input.
         epsilon (float): Clipping range for GRPO update (unused here).
         kl_coeff (float): KL divergence coefficient (beta).
+        kl_clip (float): Maximum value to clip per_token_kl.
+        advantage_clip (Tuple[float, float]): Range to clip advantages.
     """
 
     def __init__(
-        self, num_output_chunks: int = 8, epsilon: float = 0.1, kl_coeff: float = 0.1
+        self,
+        num_output_chunks: int = 8,
+        epsilon: float = 0.1,
+        kl_coeff: float = 0.1,
+        kl_clip: float = 100000.0,
+        advantage_clip: Tuple[float, float] = (-100000.0, 100000.0),
     ):
         super().__init__()
         self.num_output_chunks = num_output_chunks
         self.epsilon = epsilon
         self.kl_coeff = kl_coeff
+        self.kl_clip = kl_clip
+        self.advantage_clip = advantage_clip
 
     def compute_per_token_quantities(
         self,
         pi_logits_chunk: torch.Tensor,  # [B*G, chunk_size, V]
         targets_chunk: torch.Tensor,  # [B*G, chunk_size]
         ref_logprobs_chunk: torch.Tensor,  # [B*G, chunk_size]
+        old_logprobs_chunk: torch.Tensor,  # [B*G, chunk_size]
+        padding_masks_chunk: torch.Tensor,  # [B*G, chunk_size]
         advantages: torch.Tensor,  # [B*G]
     ) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
         # Compute pi_logprobs using cross_entropy
-        pi_logits_flat = pi_logits_chunk.reshape(
-            -1, pi_logits_chunk.size(-1)
-        )  # Fixed line
-        targets_flat = targets_chunk.reshape(-1)  # Consistent use of reshape
+        pi_logits_flat = pi_logits_chunk.reshape(-1, pi_logits_chunk.size(-1))
+        targets_flat = targets_chunk.reshape(-1)
         pi_logprobs_chunk = -F.cross_entropy(
             pi_logits_flat.float(), targets_flat, reduction="none"
         )
-        pi_logprobs_chunk = pi_logprobs_chunk.view_as(
-            targets_chunk
-        )  # view_as is safe here
+        pi_logprobs_chunk = pi_logprobs_chunk.view_as(targets_chunk)
 
-        # Detach for efficiency
-        pi_logprobs_detached = pi_logprobs_chunk.detach()
-        ref_logprobs_detached = ref_logprobs_chunk.detach()
+        # Log positions where ref_logprobs == 0
+        zero_ref_mask = (ref_logprobs_chunk == 0) & (padding_masks_chunk == 1)
+        if zero_ref_mask.any():
+            for batch_idx in range(ref_logprobs_chunk.shape[0]):
+                batch_mask = zero_ref_mask[batch_idx]
+                if batch_mask.any():
+                    ref_lp_zeros = ref_logprobs_chunk[batch_idx][batch_mask]
+                    pi_lp_zeros = pi_logprobs_chunk[batch_idx][batch_mask]
+                    mask_vals = padding_masks_chunk[batch_idx][batch_mask]
+                    token_ids = targets_chunk[batch_idx][batch_mask]
+                    indices = torch.nonzero(batch_mask, as_tuple=True)
+                    log.info(
+                        f"Batch {batch_idx} - Positions where ref_logprobs == 0 (unmasked):\n"
+                        f"ref_logprobs: {ref_lp_zeros},\n"
+                        f"pi_logprobs: {pi_lp_zeros},\n"
+                        f"mask_values: {mask_vals},\n"
+                        f"token_ids: {token_ids},\n"
+                        f"indices: {indices}"
+                    )
 
-        # KL term
-        per_token_kl = (
-            torch.exp(ref_logprobs_detached - pi_logprobs_chunk)
-            - (ref_logprobs_detached - pi_logprobs_chunk)
-            - 1
+        # Compute difference
+        log_diff = (
+            ref_logprobs_chunk - pi_logprobs_chunk
+        ) * padding_masks_chunk.float()
+
+        # Find indices where difference is large (e.g., > 10)
+        large_diff_mask = log_diff > 3
+        if large_diff_mask.any():
+            large_diff_indices = torch.nonzero(large_diff_mask, as_tuple=False)
+            for idx in large_diff_indices[:5]:
+                batch_idx, seq_idx = idx[0], idx[1]
+                ref_lp = ref_logprobs_chunk[batch_idx, seq_idx].item()
+                pi_lp = pi_logprobs_chunk[batch_idx, seq_idx].item()
+                target_token = targets_chunk[batch_idx, seq_idx].item()
+                mask_value = padding_masks_chunk[batch_idx, seq_idx].item()
+                log.info(
+                    f"Large diff at batch={batch_idx}, seq={seq_idx}: ref_logprob={ref_lp:.4f}, pi_logprob={pi_lp:.4f}, diff={ref_lp - pi_lp:.4f}, token_id={target_token}, mask_value={mask_value}"
+                )
+
+        # Existing logging
+        log.info(f"Max ref_logprobs - pi_logprobs: {log_diff.max().item()}")
+        log.info(f"Mean ref_logprobs - pi_logprobs: {log_diff.mean().item()}")
+        log.info(f"Max advantage: {advantages.max().item()}")
+        log.info(f"Mean advantage: {advantages.mean().item()}")
+
+        policy_ratio = torch.exp(pi_logprobs_chunk - old_logprobs_chunk)
+        log.info(f"Max policy ratio: {policy_ratio.max().item()}")
+        log.info(f"Mean policy ratio: {policy_ratio.mean().item()}")
+
+        # Rest of the function remains unchanged
+        clipped_advantages = torch.clamp(
+            advantages, self.advantage_clip[0], self.advantage_clip[1]
         )
-
-        # Policy term
         per_token_policy_loss = (
-            torch.exp(pi_logprobs_chunk - pi_logprobs_detached) * advantages[:, None]
+            torch.exp(pi_logprobs_chunk - old_logprobs_chunk)
+            * clipped_advantages[:, None]
         )
-
-        # Total per-token loss
+        per_token_kl = torch.clamp(
+            torch.exp(ref_logprobs_chunk - pi_logprobs_chunk)
+            - (ref_logprobs_chunk - pi_logprobs_chunk)
+            - 1,
+            max=self.kl_clip,
+        )
         per_token_loss = -(per_token_policy_loss - self.kl_coeff * per_token_kl)
 
         return per_token_loss, per_token_policy_loss, per_token_kl, pi_logprobs_chunk
@@ -345,6 +402,7 @@ class GRPOWithChunkedOutputLoss(nn.Module):
         targets: torch.Tensor,  # [B*G, response_length]
         ref_logprobs: torch.Tensor,  # [B*G, response_length]
         advantages: torch.Tensor,  # [B*G]
+        old_logprobs: torch.Tensor,  # [B*G, response_length]
         padding_masks: Optional[torch.Tensor] = None,  # [B*G, response_length]
     ) -> Tuple[
         torch.Tensor,
@@ -368,6 +426,7 @@ class GRPOWithChunkedOutputLoss(nn.Module):
         # Chunk sequence tensors
         targets_chunks = targets.chunk(num_chunks, dim=1)
         ref_logprobs_chunks = ref_logprobs.chunk(num_chunks, dim=1)
+        old_logprobs_chunks = old_logprobs.chunk(num_chunks, dim=1)
 
         # Default to all-ones mask if padding_masks is None
         if padding_masks is None:
@@ -385,6 +444,7 @@ class GRPOWithChunkedOutputLoss(nn.Module):
 
         # Process each chunk
         for chunk_idx in range(num_chunks):
+            padding_masks_chunk = padding_masks_chunks[chunk_idx]
             (
                 per_token_loss_chunk,
                 per_token_policy_loss_chunk,
@@ -394,11 +454,12 @@ class GRPOWithChunkedOutputLoss(nn.Module):
                 pi_logits[chunk_idx],
                 targets_chunks[chunk_idx],
                 ref_logprobs_chunks[chunk_idx],
+                old_logprobs_chunks[chunk_idx],
+                padding_masks_chunk,
                 advantages,
             )
 
             # Accumulate with padding mask applied
-            padding_masks_chunk = padding_masks_chunks[chunk_idx]
             total_loss_sum += (per_token_loss_chunk * padding_masks_chunk).sum(dim=1)
             with torch.no_grad():
                 total_policy_sum += (
