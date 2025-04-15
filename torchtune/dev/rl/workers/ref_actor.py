@@ -270,16 +270,6 @@ class RefActor:
                 self._tokenizer.pad_id,
             )
 
-            # Generate masks and position IDs
-            masks = generation.get_causal_mask_from_padding_mask(
-                query_response_padding_masks
-            )
-            position_ids = generation.get_position_ids_from_padding_mask(
-                query_response_padding_masks
-            )
-            context_length = query_responses.shape[1] - responses.shape[1]
-            del query_response_padding_masks
-
             # Compute rewards
             responses = responses.reshape(batch_size, group_size, -1)
             rewards_by_fn, successes_by_fn, reward_metadata = batched_rewards(

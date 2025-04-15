@@ -785,7 +785,7 @@ class PyTorchActorModel:
             if self._is_rank_zero:
                 train_replay_buffer_size = len(self.replay_buffer)
 
-            while not len(self.replay_buffer):
+            while len(self.replay_buffer) < self.batch_size:
                 log.info("waiting for replay buffer")
                 time.sleep(1.0)
 
@@ -862,9 +862,9 @@ class PyTorchActorModel:
             # Log metrics
             total_step_time = time.perf_counter() - time_step_start
             if self._is_rank_zero and self._steps_run % self._log_every_n_steps == 0:
-                log.info("logging metrics")
+                log.info(f"Logging metrics at step {self._steps_run}")
                 self._log_metrics(
-                    step_idx=self.global_step,
+                    step_idx=self._steps_run,
                     trajectory=prepared_trajectory,
                     grpo_stats=grpo_stats,
                     total_step_time=total_step_time,
@@ -941,22 +941,46 @@ class PyTorchActorModel:
             context_length (int): Length of the context sequence.
             metadata (dict): Metadata for logging
         """
-        # Extract components from raw trajectory
-        query_responses = raw_trajectory.query_responses
-        responses = raw_trajectory.responses
-        logprobs = raw_trajectory.logprobs
-        ref_logprobs = raw_trajectory.ref_logprobs
-        query_response_padding_masks = raw_trajectory.query_response_padding_masks
-        seq_lens = raw_trajectory.seq_lens
-        advantages = raw_trajectory.advantages
 
-        # Compute padded tokens percentage
-        total_tokens = query_responses.numel()
+        # Define padding values for different keys
+        padding_values = {
+            "query_responses": self._tokenizer.pad_id,
+            "responses": self._tokenizer.pad_id,
+            "logprobs": -1e9,
+            "ref_logprobs": -1e9,
+            "query_response_padding_masks": False,  # False means it should be masked
+        }
+
+        # Fetch data from raw_trajectory
+        trajectory_data = {}
+        for key in raw_trajectory.keys():
+            if key in padding_values:
+                # Get padded tensor for sequence keys
+                padded_tensor = raw_trajectory.get(
+                    key,
+                    as_padded_tensor=True,
+                    padding_value=padding_values[key],
+                    padding_side="right",
+                )
+                trajectory_data[key] = padded_tensor
+            else:
+                # Non-sequence keys (scalars, metadata, etc.)—no padding
+                trajectory_data[key] = raw_trajectory.get(key)
+
+        # Extract components from raw trajectory
+        query_responses = trajectory_data["query_responses"]
+        responses = trajectory_data["responses"]
+        logprobs = trajectory_data["logprobs"]
+        ref_logprobs = trajectory_data["ref_logprobs"]
+        query_response_padding_masks = trajectory_data["query_response_padding_masks"]
+        advantages = trajectory_data["advantages"]
+
+        # Compute padded tokens percentage for logging
+        number_of_tokens = query_responses.numel()
         padded_tokens = (query_responses == self._tokenizer.pad_id).sum().item()
         padded_tokens_percentage = (
-            (padded_tokens / total_tokens) * 100 if total_tokens > 0 else 0
+            (padded_tokens / number_of_tokens) * 100 if number_of_tokens > 0 else 0
         )
-        number_of_tokens = seq_lens.sum().item()
 
         # Truncate sequences at first stop token
         response_padding_masks, responses = rlhf.truncate_sequence_at_first_stop_token(
@@ -1004,7 +1028,6 @@ class PyTorchActorModel:
             "rewards": raw_trajectory.rewards,
             "successes": raw_trajectory.successes,
             "reward_metadata": raw_trajectory.reward_metadata,
-            "query_response_padding_masks": raw_trajectory.query_response_padding_masks,
         }
 
         return prepared_trajectory, context_length, metadata
