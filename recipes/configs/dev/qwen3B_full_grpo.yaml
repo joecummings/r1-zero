@@ -72,7 +72,7 @@ save_every_n_epochs: 1
 
 # Fine-tuning arguments
 batch_size: 32 # how many samples are sampled from the replay_buffer by PyTorchActorModel
-grpo_samples: 16 # used in LLMCollector, RefActor, and PyTorchActorModel
+grpo_samples: 4 # used in LLMCollector, RefActor, and PyTorchActorModel
 max_generated_tokens: 512
 top_k: null
 temperature: 1.0
@@ -129,7 +129,7 @@ log_every_n_steps: 1
 log_peak_memory_stats: True
 
 debug_logging_enabled: True
-debug_num_samples_per_step: 1
+debug_num_samples_per_step: 4
 
 # Profiler (disabled)
 profiler:
