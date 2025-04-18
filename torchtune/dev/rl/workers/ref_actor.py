@@ -278,7 +278,6 @@ class RefActor:
 
             # Compute advantages: B, G, num_funcs -> B, G
             group_rewards = rewards_by_fn.sum(-1)
-            group_successes = successes_by_fn.sum(-1)
 
             # To compute advantage, subtract the mean of the group rewards from each group reward
             group_advantages = (group_rewards - group_rewards.mean(1, keepdim=True)) / (
@@ -288,24 +287,25 @@ class RefActor:
             # Repack trajectory with policy_version
 
             trajectory = Trajectory(
-                query_responses=trajectory.query_responses,
-                responses=trajectory.responses,
-                logprobs=trajectory.logprobs,
-                ref_logprobs=ref_logprobs,
-                query_response_padding_masks=trajectory.query_response_padding_masks,
-                seq_lens=trajectory.seq_lens,
-                answers=trajectory.answers,
-                policy_version=trajectory.policy_version,
+                query_responses=trajectory.query_responses,                  # shape: (B*G, P+R)
+                responses=trajectory.responses,                              # shape: (B*G, R)
+                logprobs=trajectory.logprobs,                                # shape: (B*G, R)
+                ref_logprobs=ref_logprobs,                                   # shape: (B*G, R)
+                query_response_padding_masks=trajectory.query_response_padding_masks,  # shape: (B*G, P+R)
+                seq_lens=trajectory.seq_lens,                                # shape: (B*G,)
+                answers=trajectory.answers,                                  # shape: (B*G,)
+                policy_version=trajectory.policy_version,                    # scalar
                 rewards=rewards_by_fn.reshape(
                     batch_size * group_size, -1
-                ),  # (B, G, num_funcs)
-                advantages=group_advantages.reshape(batch_size * group_size),  # (B, G)
+                ),                                                           # shape: (B*G, num_funcs)
+                advantages=group_advantages.reshape(batch_size * group_size),# shape: (B*G,)
                 successes=successes_by_fn.reshape(
                     batch_size * group_size, -1
-                ),  # (B, G, num_funcs)
-                reward_metadata=reward_metadata,
-                batch_size=batch_size * group_size,
-                sequence_ids=trajectory.sequence_ids,
+                ),                                                           # shape: (B*G, num_funcs)
+                reward_metadata=reward_metadata,                             # dict of metadata
+                sequence_ids=trajectory.sequence_ids,                        # shape: (B*G,)
+                # argument for tensor class. Not part of trajectory.
+                batch_size=batch_size * group_size,                          # int
             )
 
             log.info(f"Constructed trajectory: {trajectory}")

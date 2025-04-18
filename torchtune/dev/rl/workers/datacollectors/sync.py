@@ -158,6 +158,9 @@ class SyncLLMCollector(SyncDataCollector):
         seq_lens = training.get_unmasked_sequence_lengths(response_padding_masks)
         del response_padding_masks
 
+        #TODO: add assertion that every token after stop_token is a pad id. 
+        # i.e. we dont need truncate_sequence_at_first_stop_token
+        
         # Generate unique sequence IDs for the batch
         # FIXME: it outputs a List[List[str]] when sampling from replay buffer, with shape num_samples X 16.
         # It should have shape num_samplesX1, so we can log a single sequence_id per sequence.
@@ -171,19 +174,19 @@ class SyncLLMCollector(SyncDataCollector):
         self._sequence_counter += batch_size
 
         postprocessed_results = Trajectory(
-            query_responses=query_responses,
-            responses=response_tokens,
-            logprobs=logprobs,
+            query_responses=query_responses,  # shape: (B*G, P+R)
+            responses=response_tokens,  # shape: (B*G, R) 
+            logprobs=logprobs,  # shape: (B*G, R)
             ref_logprobs=None,
-            query_response_padding_masks=query_response_padding_masks,
-            seq_lens=seq_lens,
-            answers=answers,
-            policy_version=policy_version,
+            query_response_padding_masks=query_response_padding_masks,  # shape: (B*G, P+R)
+            seq_lens=seq_lens,  # shape: (B*G,)
+            answers=answers,  # shape: (B*G,)
+            policy_version=policy_version,  # scalar
             rewards=None,
             advantages=None,
             successes=None,
             reward_metadata=None,
-            sequence_ids=sequence_ids,
+            sequence_ids=sequence_ids,  # shape: (B*G,)
         )
 
         total_generated_tokens = seq_lens.sum().item()
