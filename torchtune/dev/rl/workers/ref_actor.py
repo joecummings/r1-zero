@@ -157,8 +157,8 @@ class RefActor:
             }
         )
 
-        rewards_mean = torch.stack([reward_output.total_reward.mean() for reward_output in reward_outputs]).mean()
-        successes_mean = torch.stack([reward_output.successes.mean() for reward_output in reward_outputs]).mean()
+        rewards_mean = torch.Tensor([reward_output.total_reward.mean() for reward_output in reward_outputs]).mean()
+        successes_mean = torch.Tensor([reward_output.successes.mean() for reward_output in reward_outputs]).mean()
         log_dict.update(
             {
                 "ref_actor_rewards/rewards_mean": rewards_mean.item(),
