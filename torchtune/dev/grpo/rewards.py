@@ -5,16 +5,110 @@
 # LICENSE file in the root directory of this source tree.
 
 import re
-from typing import List, Tuple
+from typing import Dict, List, Protocol, Tuple, Union
 from xml.etree import ElementTree as ET
 
 import torch
-
-# from tensordict import TensorDict, TensorDictBase
-# from torchrl.data import Composite, TensorSpec, Unbounded
-# from torchrl.envs import Transform
+from dataclasses import dataclass
 
 from torchtune.modules.transforms.tokenizers import ModelTokenizer
+
+@dataclass
+class RewardOutput:
+    reward_base_name: str
+    total_reward: str
+    reward_names: List[str]
+    rewards: torch.Tensor
+    successes: torch.Tensor
+
+    def log(self, prefix: str = "") -> Dict[str, float]:
+        log_dict = {}
+        prefix = f"{prefix}/{self.reward_base_name}" if prefix else self.reward_base_name
+        for reward_name, reward in zip(self.reward_names, self.rewards):
+            log_dict[f"{prefix}/{reward_name}"] = reward.mean().item()
+        log_dict[f"{prefix}"] = self.total_reward.mean().item()
+        return log_dict
+
+
+class RewardBase(Protocol):
+    def __call__(
+        self,
+        completion_ids: torch.Tensor,
+        completions: List[str],
+        answers: List[str],
+        device: torch.device,
+    ) -> RewardOutput:
+        pass
+
+
+class MathCorrectnessReward(RewardBase):
+    def __init__(self, correct_answer_reward: float):
+        self.correct_answer_reward = correct_answer_reward
+    def __call__(
+        self,
+        completion_ids: torch.Tensor,
+        completions: List[str],
+        answers: List[str],
+        device: torch.device,
+    ) -> RewardOutput:
+        rewards = []
+        successes = []
+        for completion, answer in zip(completions, answers):
+            cot, potential_answer = extract_tags(f"<think>{completion}")
+            reward, success = math_response_correct(cot, answer, potential_answer)
+            rewards.append(reward)
+            successes.append(success)
+        return RewardOutput(
+            reward_base_name="math_correctness",
+            total_reward=torch.tensor(rewards)
+        )
+
+class FormattingReward(RewardBase):
+    def __init__(self, start_tag: str, end_tag: str):
+        self.start_tag = start_tag
+        self.end_tag = end_tag
+
+    def __call__(
+        self,
+        completion_ids: torch.Tensor,
+        completions: List[str],
+        answers: List[str],
+        device: torch.device,
+    ) -> RewardOutput:
+        return RewardOutput(
+            reward_base_name="formatting",
+            total_reward=torch.tensor(0.0)
+        )
+
+#### example rewards ####
+
+class DummyMultiReward(RewardBase):
+    def __call__(
+        self,
+        completion_ids: torch.Tensor,
+        completions: List[str],
+        answers: List[str],
+        device: torch.device,
+    ) -> RewardOutput:
+
+        compile_rewards = torch.randn(len(completions), device=device)
+        dummy_rewards_1 = []
+        for completion, answer, dummy_reward_0 in zip(completions, answers, dummy_rewards_0):
+            if dummy_reward_0 > 0.0:
+                dummy_rewards_1.append(1)
+            else:
+                dummy_rewards_1.append(0)
+        dummy_rewards_0 = torch.tensor(dummy_rewards_0) 
+        dummy_rewards_1 = torch.tensor(dummy_rewards_1)
+        total_reward = dummy_rewards_0 + dummy_rewards_1
+        total_success = torch.tensor(dummy_rewards_1)
+        return RewardOutput(
+            reward_base_name="interpreter_reward",
+            total_reward=total_reward,
+            names=["dummy_reward_0", "dummy_success"],
+            rewards=[dummy_rewards_0, dummy_rewards_1],
+            successes=total_success
+        )
 
 
 def extract_tags(text: str) -> Tuple[str, str]:
@@ -58,7 +152,8 @@ def math_response_correct(
 
 def batched_rewards(
     tokenizer: ModelTokenizer,
-    completions: torch.Tensor,
+    completion_ids: torch.Tensor,
+    completions: str,
     answers: List[str],
     device: torch.device,
 ) -> Tuple[torch.Tensor, torch.Tensor, dict]:

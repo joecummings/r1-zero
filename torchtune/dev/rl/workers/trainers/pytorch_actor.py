@@ -739,10 +739,10 @@ class PyTorchActorModel:
         seq_lens = raw_trajectory.seq_lens
         answers = raw_trajectory.answers
         policy_version = raw_trajectory.policy_version
-        rewards = raw_trajectory.rewards
+        # rewards = raw_trajectory.rewards
         advantages = raw_trajectory.advantages
-        successes = raw_trajectory.successes
-        reward_metadata = raw_trajectory.reward_metadata
+        # successes = raw_trajectory.successes
+        # reward_metadata = raw_trajectory.reward_metadata
 
         # Compute padded tokens percentage
         total_tokens = query_responses.numel()
@@ -786,7 +786,7 @@ class PyTorchActorModel:
             "padded_tokens_percentage": padded_tokens_percentage,
             "number_of_tokens": number_of_tokens,
             "policy_version": policy_version,
-            "reward_metadata": reward_metadata,
+            # "reward_metadata": reward_metadata,
         }
 
         return trajectory, context_length, metadata
