@@ -91,7 +91,6 @@ class DummyMultiReward(RewardBase):
         device: torch.device,
     ) -> RewardOutput:
 
-        compile_rewards = torch.randn(len(completions), device=device)
         dummy_rewards_1 = []
         for completion, answer, dummy_reward_0 in zip(completions, answers, dummy_rewards_0):
             if dummy_reward_0 > 0.0:
@@ -105,7 +104,7 @@ class DummyMultiReward(RewardBase):
         return RewardOutput(
             reward_base_name="interpreter_reward",
             total_reward=total_reward,
-            names=["dummy_reward_0", "dummy_success"],
+            reward_names=["compilation_reward", "accuracy_reward"],
             rewards=[dummy_rewards_0, dummy_rewards_1],
             successes=total_success
         )
