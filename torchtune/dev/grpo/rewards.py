@@ -16,15 +16,15 @@ from torchtune.modules.transforms.tokenizers import ModelTokenizer
 @dataclass
 class RewardOutput:
     reward_base_name: str
-    total_reward: str
-    reward_names: List[str]
-    rewards: torch.Tensor
+    total_reward: torch.Tensor
     successes: torch.Tensor
+    # optional
+    rewards: Dict[str, torch.Tensor] 
 
     def log(self, prefix: str = "") -> Dict[str, float]:
         log_dict = {}
         prefix = f"{prefix}/{self.reward_base_name}" if prefix else self.reward_base_name
-        for reward_name, reward in zip(self.reward_names, self.rewards):
+        for reward_name, reward in self.rewards.items():
             log_dict[f"{prefix}/{reward_name}"] = reward.mean().item()
         log_dict[f"{prefix}"] = self.total_reward.mean().item()
         return log_dict
@@ -100,12 +100,14 @@ class DummyMultiReward(RewardBase):
         dummy_rewards_0 = torch.tensor(dummy_rewards_0) 
         dummy_rewards_1 = torch.tensor(dummy_rewards_1)
         total_reward = dummy_rewards_0 + dummy_rewards_1
-        total_success = torch.tensor(dummy_rewards_1)
+        total_success = dummy_rewards_1 > 0.0
         return RewardOutput(
             reward_base_name="interpreter_reward",
             total_reward=total_reward,
-            reward_names=["compilation_reward", "accuracy_reward"],
-            rewards=[dummy_rewards_0, dummy_rewards_1],
+            rewards={
+                "compilation_reward": dummy_rewards_0,
+                "accuracy_reward": dummy_rewards_1,
+            },
             successes=total_success
         )
 
