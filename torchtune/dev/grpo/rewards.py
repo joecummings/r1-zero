@@ -27,6 +27,7 @@ class RewardOutput:
         for reward_name, reward in self.rewards.items():
             log_dict[f"{prefix}/{reward_name}"] = reward.mean().item()
         log_dict[f"{prefix}"] = self.total_reward.mean().item()
+        log_dict[f"{prefix}/successes"] = self.successes.mean().item()
         return log_dict
 
 
@@ -78,7 +79,7 @@ class FormattedMathCorrectnessReward(RewardBase):
         return RewardOutput(
             reward_base_name="math_correctness",
             total_reward=rewards,
-            successes=(rewards > 0.0).float()
+            successes=(rewards == self.positive_reward).float()
         )
 
 class ThinkingAnswerFormattingReward(RewardBase):
@@ -136,7 +137,7 @@ class ThinkingAnswerFormattingReward(RewardBase):
         soft_format_rewards = torch.tensor(soft_format_rewards)
         strict_format_rewards = torch.tensor(strict_format_rewards)
         rewards = soft_format_rewards + strict_format_rewards
-        successes = (rewards > 0.0).float()
+        successes = (rewards >= self.positive_reward).float()
         return RewardOutput(
             reward_base_name="formatting",
             total_reward=rewards,
