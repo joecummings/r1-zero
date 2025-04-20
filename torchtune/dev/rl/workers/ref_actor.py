@@ -2,7 +2,6 @@ from typing import Any, Dict, List
 
 import ray
 import torch
-from torchtune.dev.rl import rewards
 import torchtune.training as training
 from omegaconf import DictConfig
 
@@ -114,11 +113,6 @@ class RefActor:
         # full_queue_data_discard,
         rollout_queue_size,
         reward_outputs,
-        rewards_mean,
-        successes_mean,
-        # rewards_mean_per_func,
-        # successes_mean_per_func,
-        # reward_metadata,
     ):
         """Log metrics for the RefActor, only on actor zero."""
         if not self._is_actor_zero:
@@ -157,8 +151,8 @@ class RefActor:
             }
         )
 
-        rewards_mean = torch.Tensor([reward_output.total_reward.mean() for reward_output in reward_outputs]).mean()
-        successes_mean = torch.Tensor([reward_output.successes.mean() for reward_output in reward_outputs]).mean()
+        rewards_mean = torch.tensor([reward_output.total_reward.mean() for reward_output in reward_outputs]).mean()
+        successes_mean = torch.tensor([reward_output.successes.mean() for reward_output in reward_outputs]).mean()
         log_dict.update(
             {
                 "ref_actor_rewards/rewards_mean": rewards_mean.item(),
@@ -166,26 +160,9 @@ class RefActor:
             }
         )
 
-        # # TODO we should encode this in the dataclass instead of keeping a dict
-        # # otherwise we end up with a list of identical dicts
-        # assert all(
-        #     metadata["func_names"] == reward_metadata[0]["func_names"]
-        #     for metadata in reward_metadata
-        # ), "Function names in reward_metadata are not consistent across all entries"
-        # function_names = reward_metadata[0]["func_names"]
         for reward_output in reward_outputs:
-            log_dict.update(reward_output.log())
-        # function_names = reward_metadata["func_names"]
+            log_dict.update(reward_output.log(prefix="ref_actor_rewards"))
 
-        # # Per-function rewards and successes
-        # for func_name, func_mean in zip(function_names, rewards_mean_per_func):
-        #     log_dict[f"ref_actor_rewards/rewards_func_{func_name}_mean"] = (
-        #         func_mean.item()
-        #     )
-        # for func_name, func_mean in zip(function_names, successes_mean_per_func):
-        #     log_dict[f"ref_actor_rewards/successes_func_{func_name}_mean"] = (
-        #         func_mean.item()
-        #     )
 
         ray.get(self._metric_logger.log_dict.remote(log_dict, step=step_idx))
 
@@ -254,10 +231,6 @@ class RefActor:
             query_response_padding_masks = trajectory.query_response_padding_masks
             seq_lens = trajectory.seq_lens
             answers = trajectory.answers  # list[str] of len (B * G)
-            answers = [
-                answers[i : i + self.grpo_samples]
-                for i in range(0, len(answers), self.grpo_samples)
-            ]  # list[list[str]] of len [B, G]. Basically a reshape
 
             # Compute padded tokens percentage
             total_tokens = query_responses.numel()
@@ -289,21 +262,17 @@ class RefActor:
 
             # Compute rewards
             response_ids = responses.reshape(batch_size * group_size, -1)
-            responses_str = [self._tokenizer.decode(response_ids[i]) for i in range(batch_size * group_size)]
+            responses_str = [self._tokenizer.decode(response_ids[i].tolist()) for i in range(batch_size * group_size)]
             reward_outputs: List[RewardOutput] = []
             for reward_fn in self.reward_functions:
                 reward_outputs.append(reward_fn(
                     response_ids, responses_str, answers, device=self._device
                 ))
-            # reward_outputs = batched_rewards(
-            #     response_ids, responses_str, answers, device=self._device
-            # )  # These are (B, G, num_funcs)
-            group_rewards = torch.stack([reward_output.total_reward for reward_output in reward_outputs], dim=-1)
 
+            group_rewards = torch.stack([reward_output.total_reward for reward_output in reward_outputs], dim=-1) # (B * G, num_funcs)
+            group_rewards = group_rewards.reshape(batch_size, group_size, -1) 
             # Compute advantages: B, G, num_funcs -> B, G
             group_rewards = group_rewards.sum(-1)
-            # group_successes = reward_outputs.successes.sum(-1)
-
             # To compute advantage, subtract the mean of the group rewards from each group reward
             group_advantages = (group_rewards - group_rewards.mean(1, keepdim=True)) / (
                 group_rewards.std(1, keepdim=True) + 1e-4
@@ -320,14 +289,7 @@ class RefActor:
                 seq_lens=trajectory.seq_lens,
                 answers=trajectory.answers,
                 policy_version=trajectory.policy_version,
-                # rewards=rewards_by_fn.reshape(
-                #     batch_size * group_size, -1
-                # ),  # (B, G, num_funcs)
                 advantages=group_advantages.reshape(batch_size * group_size),  # (B, G)
-                # successes=successes_by_fn.reshape(
-                #     batch_size * group_size, -1
-                # ),  # (B, G, num_funcs)
-                # reward_metadata=reward_metadata,
                 batch_size=batch_size * group_size,
             )
 
@@ -341,11 +303,6 @@ class RefActor:
             # End of step timing
             time_total_ref_step = time.perf_counter() - time_step_start
 
-            # Calculate mean rewards and successes for logging
-            # rewards_mean_per_func = rewards_by_fn.mean(dim=(0, 1)).cpu()
-            # successes_mean_per_func = successes_by_fn.mean(dim=(0, 1)).cpu()
-            # rewards_mean = rewards_mean_per_func.mean()
-            # successes_mean = successes_mean_per_func.mean()
             # log metrics
             if self._is_actor_zero:
                 self._log_metrics(
@@ -356,12 +313,7 @@ class RefActor:
                     # TODO: what should we do with this? We can log the total number of elements written in the buffer instead
                     # full_queue_data_discard=full_queue_data_discard,
                     rollout_queue_size=rollout_queue_size,
-                    # rewards_mean=rewards_mean,
-                    # successes_mean=successes_mean,
                     reward_outputs=reward_outputs,
-                    # rewards_mean_per_func=rewards_mean_per_func,
-                    # successes_mean_per_func=successes_mean_per_func,
-                    # reward_metadata=reward_metadata,
                 )
 
             torch.cuda.empty_cache()

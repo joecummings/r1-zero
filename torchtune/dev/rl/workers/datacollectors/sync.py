@@ -166,10 +166,7 @@ class SyncLLMCollector(SyncDataCollector):
             seq_lens=seq_lens,
             answers=answers,
             policy_version=policy_version,
-            rewards=None,
             advantages=None,
-            successes=None,
-            reward_metadata=None,
         )
 
         total_generated_tokens = seq_lens.sum().item()

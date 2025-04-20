@@ -13,7 +13,4 @@ class Trajectory(TensorClass["nocast"]):
     seq_lens: torch.Tensor
     answers: torch.Tensor
     policy_version: int
-    rewards: torch.Tensor
     advantages: torch.Tensor
-    successes: torch.Tensor
-    reward_metadata: Dict[str, List[str]]

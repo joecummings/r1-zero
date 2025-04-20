@@ -5,11 +5,11 @@
 # LICENSE file in the root directory of this source tree.
 
 import re
-from typing import Dict, List, Protocol, Tuple, Union
+from typing import Dict, List, Optional, Protocol, Tuple, Union
 from xml.etree import ElementTree as ET
 
 import torch
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 
 from torchtune.modules.transforms.tokenizers import ModelTokenizer
 
@@ -19,7 +19,7 @@ class RewardOutput:
     total_reward: torch.Tensor
     successes: torch.Tensor
     # optional
-    rewards: Dict[str, torch.Tensor] 
+    rewards: Optional[Dict[str, torch.Tensor]] = field(default_factory=dict)
 
     def log(self, prefix: str = "") -> Dict[str, float]:
         log_dict = {}
@@ -41,9 +41,21 @@ class RewardBase(Protocol):
         pass
 
 
-class MathCorrectnessReward(RewardBase):
-    def __init__(self, correct_answer_reward: float):
-        self.correct_answer_reward = correct_answer_reward
+class FormattedMathCorrectnessReward(RewardBase):
+    """
+    This reward encourages the model to correctly answer a math problem, and requires
+    the model to repond in an XML-style format to extract answers. 
+
+    Args:
+        answer_tag: the tag for the answer section. The answer will be extracted from <{answer_tag}>{answer}</{answer_tag}>
+        positive_reward: the reward provided for correctly formatted completions
+        negative_reward: the reward provided for incorrectly formatted completions
+    """
+    def __init__(self, answer_tag: str, positive_reward: float, negative_reward: float = 0.0):
+        self.answer_tag = answer_tag
+        self.positive_reward = positive_reward
+        self.negative_reward = negative_reward
+
     def __call__(
         self,
         completion_ids: torch.Tensor,
@@ -52,21 +64,46 @@ class MathCorrectnessReward(RewardBase):
         device: torch.device,
     ) -> RewardOutput:
         rewards = []
-        successes = []
+        answer_pattern = rf"<{self.answer_tag}>(.*?)</{self.answer_tag}>"
         for completion, answer in zip(completions, answers):
-            cot, potential_answer = extract_tags(f"<think>{completion}")
-            reward, success = math_response_correct(cot, answer, potential_answer)
-            rewards.append(reward)
-            successes.append(success)
+            match = re.search(answer_pattern, completion, re.S)
+            if match:
+                answer = match.group(1).strip()
+                reward = self.positive_reward if answer == answer else self.negative_reward
+                rewards.append(reward)
+            else:
+                rewards.append(self.negative_reward)
+            
+        rewards = torch.tensor(rewards)
         return RewardOutput(
             reward_base_name="math_correctness",
-            total_reward=torch.tensor(rewards)
+            total_reward=rewards,
+            successes=(rewards > 0.0).float()
         )
 
-class FormattingReward(RewardBase):
-    def __init__(self, start_tag: str, end_tag: str):
-        self.start_tag = start_tag
-        self.end_tag = end_tag
+class ThinkingAnswerFormattingReward(RewardBase):
+    """
+    This reward encourages the model to respond in a reasoning-style format. It applies
+    both a soft and strict formatting reward.
+
+    The "soft" formatting reward rewards the model for using the tags, even if the tags do not
+    have newlines.
+
+    The "strict" formatting reward rewards the model for using the tags, and having newlines.
+
+    Taken from https://github.com/huggingface/open-r1/blob/06bdd503341f5375bf93c3720df13f8588d47712/src/open_r1/rewards.py
+
+    Args:
+        think_tag: the tag for the think section. The tag will be XML-formatted as <{think_tag}>...</{think_tag}>
+        answer_tag: the tag for the answer section. The tag will be XML-formatted as <{answer_tag}>...</{answer_tag}>
+        positive_reward: the reward provided for correctly formatted completions
+        negative_reward: the reward provided for incorrectly formatted completions
+    """
+    def __init__(self, think_tag: str, answer_tag: str, positive_reward: float, negative_reward: float = 0.0):
+        self.think_tag = think_tag
+        self.answer_tag = answer_tag
+        self.positive_reward = positive_reward
+        self.negative_reward = negative_reward
 
     def __call__(
         self,
@@ -75,42 +112,40 @@ class FormattingReward(RewardBase):
         answers: List[str],
         device: torch.device,
     ) -> RewardOutput:
+        # soft format reward pattern
+        think_pattern = rf"<{self.think_tag}>.*?</{self.think_tag}>"
+        answer_pattern = rf"<{self.answer_tag}>.*?</{self.answer_tag}>"
+
+        # strict format reward pattern
+        strict_pattern = rf"^<{self.think_tag}>\n.*?\n</{self.think_tag}>\n<{self.answer_tag}>\n.*?\n</{self.answer_tag}>\n$"
+        soft_format_rewards = []
+        strict_format_rewards = []
+        for completion in completions:
+            strict_format_rewards.append(self.positive_reward if re.match(strict_pattern, completion, re.DOTALL | re.MULTILINE) else self.negative_reward)
+
+            think_matches = re.findall(think_pattern, completion, re.DOTALL)
+            answer_matches = re.findall(answer_pattern, completion, re.DOTALL)
+            if len(think_matches) == 1 and len(answer_matches) == 1:
+                think_index = completion.find(think_matches[0])
+                answer_index = completion.find(answer_matches[0])
+                if think_index < answer_index:
+                    soft_format_rewards.append(self.positive_reward)
+                    continue
+            soft_format_rewards.append(self.negative_reward)
+
+        soft_format_rewards = torch.tensor(soft_format_rewards)
+        strict_format_rewards = torch.tensor(strict_format_rewards)
+        rewards = soft_format_rewards + strict_format_rewards
+        successes = (rewards > 0.0).float()
         return RewardOutput(
             reward_base_name="formatting",
-            total_reward=torch.tensor(0.0)
-        )
-
-#### example rewards ####
-
-class DummyMultiReward(RewardBase):
-    def __call__(
-        self,
-        completion_ids: torch.Tensor,
-        completions: List[str],
-        answers: List[str],
-        device: torch.device,
-    ) -> RewardOutput:
-
-        dummy_rewards_1 = []
-        for completion, answer, dummy_reward_0 in zip(completions, answers, dummy_rewards_0):
-            if dummy_reward_0 > 0.0:
-                dummy_rewards_1.append(1)
-            else:
-                dummy_rewards_1.append(0)
-        dummy_rewards_0 = torch.tensor(dummy_rewards_0) 
-        dummy_rewards_1 = torch.tensor(dummy_rewards_1)
-        total_reward = dummy_rewards_0 + dummy_rewards_1
-        total_success = dummy_rewards_1 > 0.0
-        return RewardOutput(
-            reward_base_name="interpreter_reward",
-            total_reward=total_reward,
+            total_reward=rewards,
             rewards={
-                "compilation_reward": dummy_rewards_0,
-                "accuracy_reward": dummy_rewards_1,
+                "soft_format_reward": soft_format_rewards,
+                "strict_format_reward": strict_format_rewards,
             },
-            successes=total_success
+            successes=successes
         )
-
 
 def extract_tags(text: str) -> Tuple[str, str]:
     """
