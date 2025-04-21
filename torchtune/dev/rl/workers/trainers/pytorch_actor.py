@@ -29,7 +29,7 @@ from torchrl.envs import LLMEnv
 from torchtune import config, generation, modules, rlhf, utils
 from torchtune.dev.grpo.rewards import batched_rewards
 from torchtune.dev.grpo.types import GRPOStats, GRPOTrajectory
-from torchtune.dev.rl.datatypes import trajectories
+from torchtune.dev.rl.datatypes.trajectory import PackedTrajectory, ScoredTrajectory
 from torchtune.dev.rl.utils import stateless_init_process_group
 from torchtune.models.qwen2._convert_weights import qwen2_tune_to_hf
 

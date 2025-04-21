@@ -7,7 +7,7 @@ from omegaconf import DictConfig
 
 from torchtune import config, generation, rlhf, utils
 from torchtune.dev.grpo.rewards import batched_rewards
-from torchtune.dev.rl.datatypes import Trajectory
+from torchtune.dev.rl.datatypes.trajectory import GroupedUnscoredTrajectories, ScoredTrajectory
 
 log = utils.get_logger("DEBUG")
 
@@ -255,16 +255,35 @@ class RefActor:
                     answers=[t.answer for t in trajectories], 
                     device='cpu'
                 )
-                #TODO: need to reshape rewards_by_fn and successes_by_fn to match
-                #  the batch/group size that batched rewards expects
 
-                # Get advantages
-                #TODO: currently this assumes a single group. Need to adjust for multiple groups packed together.
-                # probably need a group_mask
-                group_rewards = rewards_by_fn.sum(-1)
-                mean_reward = group_rewards.mean()
-                std_reward = group_rewards.std().clamp(min=1e-4)
-                advantages = (group_rewards - mean_reward) / std_reward
+                def compute_advantages(packed_trajectory: PackedTrajectory, rewards_by_fn: torch.Tensor):
+                    #TODO: this relies a lot on order of trajectories in the batch
+                    # This may be safe, but its a big assumption and may break silenly.
+                    
+                    assert rewards_by_fn.shape[0] % self.cfg.grpo_samples == 0, "rewards_by_fn must have shape[0] divisible by grpo_samples"
+
+                    group_indices = packed_trajectory.group_indices
+                    group_counts = self.cfg.grpo_samples
+                    num_groups = rewards_by_fn.shape[0] // group_counts
+
+                    # Compute per-group mean and std using scatter operations
+                    rewards_sum = torch.zeros(num_groups, device=rewards_by_fn.device).scatter_add_(
+                        0, group_indices, rewards_by_fn.sum(-1)
+                    )
+                    mean_rewards = rewards_sum / group_counts
+
+                    # Compute variance in one pass
+                    rewards_diff = rewards_by_fn.sum(-1) - mean_rewards[group_indices]
+                    rewards_var_sum = torch.zeros(num_groups, device=rewards_by_fn.device).scatter_add_(
+                        0, group_indices, rewards_diff ** 2
+                    )
+                    std_rewards = torch.sqrt(rewards_var_sum / group_counts).clamp(min=1e-4)
+
+                    # Compute advantages
+                    advantages = (rewards_by_fn.sum(-1) - mean_rewards[group_indices]) / std_rewards[group_indices]
+                    return advantages
+
+                advantages = compute_advantages(packed_trajectory, rewards_by_fn)
 
             # Prepare trajectories for replay buffer
             scored_trajectories_cpu = []

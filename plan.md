@@ -536,8 +536,22 @@ def pack_sequences(
 ) -> PackedTrajectory:
     """Packs Trajectories into a single PackedTrajectory without padding in between sequences.
 
+    For example, for 3 sequences with tokens (Prompt + Response)
+    sequences = [
+        [P1, P2, P3, P4, P5, R1, R2], 
+        [P6, R3],  
+        [P7, P8, R4, R5, R6,]
+    ]
+
+    Instead of padding to match the longest sequence, we concatenate all sequences
+    and add padding tokens to reach target_tokens_per_batch:
+    tokens = [P1, P2, P3, P4, P5, R1, R2, P6, R3, P7, P8, R4, R5, R6, PAD, PAD, PAD]
+
+    Additional masks and tensors are also computed to facilitate efficient processing. For details,
+    check out the docstring of `PackedTrajectory`.
+
     Args:
-        sequences (List[Union[UnscoredTrajectory, ScoredTrajectory]]): Sequences to pack with CPU tensors.
+        sequences (List[Union[UnscoredTrajectory, ScoredTrajectory]]): Sequences to pack.
         pad_token_id (int): Token ID for padding.
         target_tokens_per_batch (Optional[int]): Target token count for padding; if None, no padding added.
         ignore_index (int): Used when generating targets
@@ -551,12 +565,15 @@ def pack_sequences(
     if not sequences:
         raise ValueError("Cannot pack an empty list of sequences.")
 
+    # Extract the device from the first sequence's prompt_tokens
+    device = sequences[0].prompt_tokens.device
+
     num_sequences = len(sequences)
     is_scored = isinstance(sequences[0], ScoredTrajectory)
     
     # Calculate lengths
-    prompt_lens = torch.tensor([s.prompt_len for s in sequences], dtype=torch.long)
-    response_lens = torch.tensor([s.response_len for s in sequences], dtype=torch.long)
+    prompt_lens = torch.tensor([s.prompt_len for s in sequences], dtype=torch.long, device=device)
+    response_lens = torch.tensor([s.response_len for s in sequences], dtype=torch.long, device=device)
     total_lens = prompt_lens + response_lens
     packed_seq_len_no_padding = total_lens.sum().item()
     
@@ -572,7 +589,7 @@ def pack_sequences(
     total_lens_padded = total_lens.clone()
     if target_tokens_per_batch and packed_seq_len_no_padding < target_tokens_per_batch:
         pad_count = target_tokens_per_batch - packed_seq_len_no_padding
-        padding = torch.full((pad_count,), pad_token_id, dtype=torch.long)
+        padding = torch.full((pad_count,), pad_token_id, dtype=torch.long, device=device)
         tokens_list.append(padding)
 
         # Pad total length so generate masks with the correct shape
@@ -584,16 +601,16 @@ def pack_sequences(
     
     # Sequence map
     cumsum_lens = total_lens.cumsum(dim=0)
-    sequence_map = torch.zeros((num_sequences, 2), dtype=torch.long)
+    sequence_map = torch.zeros((num_sequences, 2), dtype=torch.long, device=device)
     sequence_map[1:, 0] = cumsum_lens[:-1]
     sequence_map[:, 1] = cumsum_lens
     sequence_map = sequence_map
     
     # Attention Mask
-    attention_mask = torchtune.modules.create_packed_block_causal_mask(total_lens_padded)
+    attention_mask = packed_block_causal_mask(total_lens_padded).to(device=device)
 
     # Sequence Mask
-    sequence_mask = torch.repeat_interleave(torch.arange(num_sequences), total_lens_padded)
+    sequence_mask = torch.repeat_interleave(torch.arange(num_sequences, device=device), total_lens_padded)
 
     # Response Mask
     # E.g., sequences [P1, R1, P2, P2, R2, P3, R3, PAD]
@@ -602,13 +619,13 @@ def pack_sequences(
     # E.g., sequence_mask=[0,0,1,1,1,2,2], response_start_per_token=[1,1,4,4,4,6,6]
     response_start_per_token = response_start[sequence_mask]
     # E.g., arange=[0,1,2,3,4,5,6,7], response_mask=[F,T,F,F,T,F,T,F]
-    response_mask = torch.arange(packed_seq_len_padded) >= response_start_per_token
+    response_mask = torch.arange(packed_seq_len_padded, device=device) >= response_start_per_token
     # E.g., pad_count=1, response_mask unchanged=[F,T,F,F,T,F,T,F]
     response_mask[-pad_count:] = False
 
     # create position ids
     start_per_token = sequence_map[sequence_mask, 0] # e.g. 0, 0, 0, 0, 1, 1, 2, 2, 2, 2
-    position_ids = torch.arange(packed_seq_len_padded) - start_per_token # 0, 1, 2, 0, 1, 0, 1, 2, 3   
+    position_ids = torch.arange(packed_seq_len_padded, device=device) - start_per_token # 0, 1, 2, 0, 1, 0, 1, 2, 3   
 
     # Pack additional fields for scored trajectories
     ref_logprobs = advantages = targets = None
@@ -624,13 +641,13 @@ def pack_sequences(
 
         # Find the indices of the last response token in each sequence
         last_response_indices = response_lens.cumsum(dim=0)
-        last_response_indices = cum_response_lens - 1  # shift
+        last_response_indices = last_response_indices - 1  # shift
 
         # Set the last token of each sequence to ignore_index
         targets[last_response_indices] = ignore_index
 
     # Assertions for shapes
-    assert tokens.shape == (packed_seq_len_padded,),f "Tokens shape mismatch. Expected: {packed_seq_len_padded}, Actual: {tokens.shape}"
+    assert tokens.shape == (packed_seq_len_padded,), f"Tokens shape mismatch. Expected: {packed_seq_len_padded}, Actual: {tokens.shape}"
     assert attention_mask.shape == (packed_seq_len_padded, packed_seq_len_padded), f"Attention mask shape mismatch. Expected: {packed_seq_len_padded}, Actual: {attention_mask.shape}"
     assert position_ids.shape == (packed_seq_len_padded,), f"Position IDs shape mismatch. Expected: {packed_seq_len_padded}, Actual: {position_ids.shape}"
     assert response_mask.shape == (packed_seq_len_padded,), f"Response mask shape mismatch. Expected: {packed_seq_len_padded}, Actual: {response_mask.shape}"
@@ -678,56 +695,6 @@ def unpack_response_logprobs(
     """
     response_lens_list = packed_trajectory.response_lens.tolist()
     return torch.split(packed_logprobs, response_lens_list)
-
-def compute_response_logprobs(
-    logits: torch.Tensor,
-    tokens: torch.Tensor,
-    sequence_map: torch.Tensor,
-    prompt_lens: torch.Tensor,
-    temperature: float = 1.0
-) -> torch.Tensor:
-    """Computes log probabilities for the response tokens within a packed sequence tensor.
-
-    Args:
-        logits (torch.Tensor): Raw logits output from the model, shape: (packed_seq_len, V).
-        tokens (torch.Tensor): Packed token sequence tensor, shape: (packed_seq_len,).
-        sequence_map (torch.Tensor): Mapping sequence index to start/end positions, shape: (num_sequences, 2).
-        prompt_lens (torch.Tensor): Length of each prompt, shape: (num_sequences,).
-        temperature (float): Temperature for logsoftmax scaling.
-
-    Returns:
-        torch.Tensor: Flat tensor of log probabilities for response tokens, shape: (total_response_tokens,).
-
-    Example:
-        ref_logprobs = compute_response_logprobs(logits, tokens, sequence_map, prompt_lens)
-    """
-    logprobs_list = []
-    for i in range(sequence_map.shape[0]):
-        start_idx, end_idx = sequence_map[i]
-        prompt_len = prompt_lens[i].item()
-        response_start_idx = start_idx + prompt_len
-
-        if response_start_idx >= end_idx:
-            continue
-
-        relevant_logits = logits[response_start_idx - 1:end_idx - 1]
-        targets = tokens[response_start_idx:end_idx]
-
-        if relevant_logits.shape[0] == 0:
-            continue
-
-        if temperature != 1.0:
-            relevant_logits = relevant_logits / temperature
-
-        log_probs = F.log_softmax(relevant_logits, dim=-1)
-        sequence_logprobs = log_probs.gather(1, targets.unsqueeze(-1)).squeeze(-1)
-        logprobs_list.append(sequence_logprobs)
-
-    if not logprobs_list:
-        return torch.tensor([], device=logits.device, dtype=logits.dtype)
-
-    return torch.cat(logprobs_list)
-```
 
 ## Optimization Note
 

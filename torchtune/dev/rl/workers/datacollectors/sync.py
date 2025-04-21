@@ -24,11 +24,10 @@ from torchrl.collectors import (
 from collections import defaultdict
 from torchrl.envs import LLMEnv
 from torchtune import config, utils
-from torchtune.dev.rl.datatypes import Trajectory
 from torchtune.dev.rl.utils import stateless_init_process_group
 from vllm import LLM, SamplingParams
 from vllm.worker.worker import Worker
-
+from torchtune.dev.rl.datatypes.trajectory import UnscoredTrajectory, GroupedUnscoredTrajectories
 log = utils.get_logger()
 
 
