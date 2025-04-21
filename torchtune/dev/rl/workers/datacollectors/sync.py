@@ -21,6 +21,7 @@ from torchrl.collectors import (
     SyncDataCollector,
 )
 
+from collections import defaultdict
 from torchrl.envs import LLMEnv
 from torchtune import config, utils
 from torchtune.dev.rl.datatypes import Trajectory
@@ -134,63 +135,92 @@ class SyncLLMCollector(SyncDataCollector):
         self._remote_weight_updater = value
 
     def _postprocess_for_queue(self, data):
+        """Postprocesses vLLM output into grouped trajectories for the rollout queue.
+
+        It does it by, extracting data from the batch, creating unique identifiers, creating trajectories
+        and grouping them by grpo_samples.
+
+        Args:
+            data: TensorDict with vLLM output (tokens, log_probs, etc.).
+
+        Returns:
+            tuple: (grouped_trajectories, total_generated_tokens)
+                - grouped_trajectories: List of GroupedUnscoredTrajectories enqueued.
+                - total_generated_tokens: Total number of response tokens generated.
+
+        """
         # local import to avoid vLLM no CUDA GPUs available error
         from torchtune import training
 
-        data = data.squeeze()
-        query_responses = torch.cat([data["tokens"], data["tokens_response"]], dim=-1)
-        prompt_tokens = data["tokens"]
-        response_tokens = data["tokens_response"]
-        logprobs = data["log_probs"]
-        query_response_padding_masks = torch.ne(query_responses, self._tokenizer.pad_id)
-        answers = data["answers"]
-        if hasattr(
-            self.inference_server.llm_engine.model_executor.driver_worker.worker,
-            "policy_version",
-        ):
-            policy_version = (
-                self.inference_server.llm_engine.model_executor.driver_worker.worker.policy_version.item()
-            )
-        else:
-            policy_version = 0
-
-        response_padding_masks = torch.eq(response_tokens, self._tokenizer.pad_id)
-        seq_lens = training.get_unmasked_sequence_lengths(response_padding_masks)
-        del response_padding_masks
-
-        #TODO: add assertion that every token after stop_token is a pad id. 
-        # i.e. we dont need truncate_sequence_at_first_stop_token
+        def get_policy_version() -> int:
+            worker = self.inference_server.llm_engine.model_executor.driver_worker.worker
+            return getattr(worker, "policy_version", -1).item() if hasattr(worker, "policy_version") else -1
         
-        # Generate unique sequence IDs for the batch
-        # FIXME: it outputs a List[List[str]] when sampling from replay buffer, with shape num_samples X 16.
-        # It should have shape num_samplesX1, so we can log a single sequence_id per sequence.
-        batch_size = query_responses.shape[0]
-        sequence_ids = NonTensorStack(
-            *[
-                f"worker{self.worker_id}_{self._sequence_counter + i}"
-                for i in range(batch_size)
-            ]
-        )
+        batch_size = data['tokens'].shape[0]
+        sequence_ids = [f"worker{self.worker_id}_{self._sequence_counter + i}" for i in range(batch_size)]
         self._sequence_counter += batch_size
 
-        postprocessed_results = Trajectory(
-            query_responses=query_responses,  # shape: (B*G, P+R)
-            responses=response_tokens,  # shape: (B*G, R) 
-            logprobs=logprobs,  # shape: (B*G, R)
-            ref_logprobs=None,
-            query_response_padding_masks=query_response_padding_masks,  # shape: (B*G, P+R)
-            seq_lens=seq_lens,  # shape: (B*G,)
-            answers=answers,  # shape: (B*G,)
-            policy_version=policy_version,  # scalar
-            rewards=None,
-            advantages=None,
-            successes=None,
-            reward_metadata=None,
-            sequence_ids=sequence_ids,  # shape: (B*G,)
-        )
+        data = data.squeeze()
+        
+        # Data extraction and unpadding
+        prompt_tokens_padded = data['tokens'].cpu()              # [B, longest_prompt]
+        response_tokens_padded = data['tokens_response'].cpu()   # [B, longest_response]
+        logprobs_padded = data['log_probs'].cpu()                # [B, longest_response]
+        answers = data['answers']                                # List[str], len B
+        policy_version = get_policy_version()
 
-        total_generated_tokens = seq_lens.sum().item()
-        return postprocessed_results, total_generated_tokens
+        trajectories = defaultdict(list)
+        for i in range(batch_size):
+            # extract data
+            prompt_tokens = prompt_tokens_padded[i]
+            response_tokens = response_tokens_padded[i]
+            logprobs = logprobs_padded[i]
+            answer = answers[i]
+            
+            # remove padding tokens
+            prompt_mask = prompt_tokens != self._tokenizer.pad_id
+            response_mask = response_tokens != self._tokenizer.pad_id
+            prompt_len = prompt_mask.sum()
+            response_len = response_mask.sum()
+            
+            prompt_tokens = prompt_tokens[prompt_mask]
+            response_tokens = response_tokens[response_mask]
+            logprobs = logprobs[response_mask]
+            
+            # group id is used to calculate advantages
+            group_idx = i // self.cfg.grpo_samples
+            group_id = f"{self.worker_id}_{self._sequence_counter}_{group_idx}"
+            
+            # create trajectory
+            traj = UnscoredTrajectory(
+                prompt_tokens=prompt_tokens,
+                response_tokens=response_tokens,
+                prompt_len=prompt_len,
+                response_len=response_len,
+                logprobs=logprobs,
+                answer=answer,
+                sequence_id=sequence_ids[i],
+                policy_version=policy_version,
+                group_id=group_id
+            )
+
+            # group trajectories by group_id
+            trajectories[traj.group_id].append(traj)
+
+        
+        # create GroupedUnscoredTrajectories for each group
+        grouped_trajectories = []
+        for group_id, traj_list in sorted(trajectories.items()):
+            total_tokens = sum(traj.prompt_len + traj.response_len for traj in traj_list)
+            grouped_traj = GroupedUnscoredTrajectories(
+                trajectories=traj_list,
+                group_id=group_id,
+                total_tokens=total_tokens
+            )
+            grouped_trajectories.append(grouped_traj)
+
+        total_generated_tokens = sum(traj.response_len for traj in trajectories)
+        return grouped_trajectories, total_generated_tokens
 
     def update_policy_weights_(
         self,
@@ -300,12 +330,13 @@ class SyncLLMCollector(SyncDataCollector):
             )
 
             while True:
-                try:
-                    self.rollout_queue.put_nowait(postprocessed_results)
-                    break
-                except QueueFull:
-                    self.rollout_queue.get()  # Remove the oldest item to make space
-                    log.warn("rollout queue full. Discarding data.")
+                for grouped_traj in postprocessed_results:
+                    try:
+                        self.rollout_queue.put_nowait(grouped_traj, block=True, timeout=1.0)
+                        break
+                    except QueueFull:
+                        self.rollout_queue.get()  # Remove the oldest item to make space
+                        log.warn("rollout queue full. Discarding data.")
 
         if self._is_collector_zero:
             # End timing the rollout step

@@ -28,12 +28,20 @@ class RefActor:
         self._device = utils.get_device(device=self.cfg.device)
         self._tokenizer = config.instantiate(self.cfg.tokenizer)
         self._dtype = training.get_dtype(self.cfg.dtype, device=self._device)
+        self._compile = cfg.get("compile", False)
+
         ref_checkpoint_dict = self.load_ref_checkpoint(
             cfg_ref_checkpointer=self.cfg.ref_checkpointer
         )
         self._ref_model = self._setup_model(
             self.cfg.model, ref_checkpoint_dict[training.MODEL_KEY]
         )
+
+        #TODO: replace with constante IGNORE_INDEX
+        self._loss_fn = torch.nn.CrossEntropyLoss(ignore_index=-100, reduction="none")
+        if self._compile:
+            training.compile_loss(self._loss_fn, verbose=self._is_rank_zero)
+
         self._temperature = self.cfg.temperature
 
         self.metric_logger = None  # Placeholder for the logger
@@ -81,6 +89,9 @@ class RefActor:
         with training.set_default_dtype(self._dtype), torch.device("meta"):
             ref_model = config.instantiate(cfg_model)
 
+        if self._compile:
+            training.compile_model(ref_model, verbose=self._is_rank_zero)
+
         with training.set_default_dtype(self._dtype), self._device:
             for m in ref_model.modules():
                 if hasattr(m, "rope_init"):
@@ -104,19 +115,41 @@ class RefActor:
 
     def _log_metrics(
         self,
-        step_idx,
-        time_total_ref_step,
-        time_model_running,
-        time_waiting_buffer,
-        # full_queue_data_discard,
-        rollout_queue_size,
-        rewards_mean,
-        successes_mean,
-        rewards_mean_per_func,
-        successes_mean_per_func,
-        reward_metadata,
-    ):
-        """Log metrics for the RefActor, only on actor zero."""
+        step_idx: int,
+        grouped_traj: GroupedUnscoredTrajectories,
+        time_total_ref_step: float,
+        time_model_running: float,
+        time_waiting_buffer: float,
+        rollout_queue_size: int,
+        rewards_mean: torch.Tensor,
+        successes_mean: torch.Tensor,
+        rewards_mean_per_func: torch.Tensor,
+        successes_mean_per_func: torch.Tensor,
+        reward_metadata: Dict,
+        number_of_tokens: int
+    ) -> None:
+        """Log metrics for the RefActor, only on actor zero.
+
+        Args:
+            step_idx (int): Current training step index.
+            grouped_traj (GroupedUnscoredTrajectories): Processed group of trajectories.
+            time_total_ref_step (float): Total time for the ref step.
+            time_model_running (float): Time spent running the model.
+            time_waiting_buffer (float): Time spent waiting for buffer.
+            rollout_queue_size (int): Size of the rollout queue.
+            rewards_mean (torch.Tensor): Mean reward across all sequences.
+            successes_mean (torch.Tensor): Mean success across all sequences.
+            rewards_mean_per_func (torch.Tensor): Mean rewards per function.
+            successes_mean_per_func (torch.Tensor): Mean successes per function.
+            reward_metadata (Dict): Metadata including function names.
+            number_of_tokens (int): Total number of response tokens processed.
+
+        Returns:
+            None
+
+        Example:
+            ref_actor._log_metrics(1, grouped_traj, 2.5, 1.2, 0.3, 10, ...)
+        """
         if not self._is_actor_zero:
             return
 
@@ -124,222 +157,157 @@ class RefActor:
         if self._log_peak_memory_stats:
             memory_stats = training.get_memory_stats(device=self._device)
             log_dict.update(
-                {
-                    f"ref_actor_performance/memory/{k}": v
-                    for k, v in memory_stats.items()
-                }
+                {f"ref_actor_performance/memory/{k}": v for k, v in memory_stats.items()}
             )
+        tokens_per_second = number_of_tokens / time_total_ref_step if time_total_ref_step > 0 else 0
 
-        pct_time_model_running = (
-            (time_model_running / time_total_ref_step) * 100
-            if time_total_ref_step > 0
-            else 0
-        )
-        pct_time_waiting_buffer = (
-            (time_waiting_buffer / time_total_ref_step) * 100
-            if time_total_ref_step > 0
-            else 0
-        )
+        log_dict.update({
+            "ref_actor_performance/time_total_ref_step (s)": time_total_ref_step,
+            "ref_actor_performance/time_model_running (s)": time_model_running,
+            "ref_actor_performance/pct_time_model_running (%)": (
+                time_model_running / time_total_ref_step * 100 if time_total_ref_step > 0 else 0
+            ),
+            "ref_actor_performance/time_waiting_buffer (s)": time_waiting_buffer,
+            "ref_actor_performance/pct_time_waiting_buffer (%)": (
+                time_waiting_buffer / time_total_ref_step * 100 if time_total_ref_step > 0 else 0
+            ),
+            "ref_actor_performance/response_tokens_processed": number_of_tokens,
+            "ref_actor_performance/tokens_per_second": tokens_per_second,
+            "queues/rollout_queue_size": rollout_queue_size,
+            "ref_actor_rewards/rewards_mean": rewards_mean.item(),
+            "ref_actor_rewards/successes_mean": successes_mean.item(),
+        })
 
-        log_dict.update(
-            {
-                "ref_actor_performance/time_total_ref_step (s)": time_total_ref_step,
-                "ref_actor_performance/time_model_running (s)": time_model_running,
-                "ref_actor_performance/pct_time_model_running (%)": pct_time_model_running,
-                "ref_actor_performance/time_waiting_buffer (s)": time_waiting_buffer,
-                "ref_actor_performance/pct_time_waiting_buffer (%)": pct_time_waiting_buffer,
-                # "queues/ref_actor_full_queue_data_discard": full_queue_data_discard,
-                "queues/rollout_queue_size": rollout_queue_size,
-            }
-        )
+        function_names = reward_metadata.get("func_names", [])
+        for func_name, r_mean, s_mean in zip(function_names, rewards_mean_per_func, successes_mean_per_func):
+            log_dict[f"ref_actor_rewards/rewards_func_{func_name}_mean"] = r_mean.item()
+            log_dict[f"ref_actor_rewards/successes_func_{func_name}_mean"] = s_mean.item()
 
-        log_dict.update(
-            {
-                "ref_actor_rewards/rewards_mean": rewards_mean.item(),
-                "ref_actor_rewards/successes_mean": successes_mean.item(),
-            }
-        )
-
-        # # TODO we should encode this in the dataclass instead of keeping a dict
-        # # otherwise we end up with a list of identical dicts
-        # assert all(
-        #     metadata["func_names"] == reward_metadata[0]["func_names"]
-        #     for metadata in reward_metadata
-        # ), "Function names in reward_metadata are not consistent across all entries"
-        # function_names = reward_metadata[0]["func_names"]
-
-        function_names = reward_metadata["func_names"]
-
-        # Per-function rewards and successes
-        for func_name, func_mean in zip(function_names, rewards_mean_per_func):
-            log_dict[f"ref_actor_rewards/rewards_func_{func_name}_mean"] = (
-                func_mean.item()
-            )
-        for func_name, func_mean in zip(function_names, successes_mean_per_func):
-            log_dict[f"ref_actor_rewards/successes_func_{func_name}_mean"] = (
-                func_mean.item()
-            )
-
-        ray.get(self._metric_logger.log_dict.remote(log_dict, step=step_idx))
+        if self._metric_logger:
+            ray.get(self._metric_logger.log_dict.remote(log_dict, step=step_idx))
+        else:
+            log.warning(f"RefActor {self.actor_id} metric logger not set, cannot log metrics.")
 
     def run(self):
+        """Main loop for processing grouped trajectories from the rollout queue."""
         import time
 
-        log.info("running ref actor")
+        log.info(f"RefActor {self.actor_id} starting run loop.")
         idx = 0
-        while True:
-            if idx == self.cfg.num_steps:
-                break
-
-            # Start measuring total step time
+        while idx < self.cfg.num_steps:
             time_step_start = time.perf_counter()
-            trajectory = None
-            if self._is_actor_zero:
-                rollout_queue_size = self.rollout_queue.qsize()
-            while trajectory is None:
-                try:
-                    if self._is_actor_zero:
-                        log.info("Getting from rollout_queue queue.")
-                    trajectory = self.rollout_queue.get(timeout=0.5)
-                    trajectory = trajectory.to(self._device)
-                except ray.util.queue.Empty:
-                    trajectory = None
-                    time.sleep(0.1)
+            rollout_queue_size = self.rollout_queue.qsize() if self._is_actor_zero else -1
+
+            #TODO: replace with generator
+            try:
+                grouped_traj = self.rollout_queue.get(block=True, timeout=1.0)
+                grouped_traj = self._move_to_device(grouped_traj)
+            except ray.util.queue.Empty:
+                log.debug(f"RefActor {self.actor_id} rollout queue empty, sleeping.")
+                time.sleep(1.0)
+                continue
+            except Exception as e:
+                log.error(f"RefActor {self.actor_id} error getting from queue: {e}")
+                time.sleep(1.0)
+                continue
+
             time_wait_end = time.perf_counter()
             time_waiting_buffer = time_wait_end - time_step_start
+            trajectories = grouped_traj.trajectories
 
-            context_length = (
-                trajectory.query_responses.shape[1] - trajectory.responses.shape[1]
+            #TODO: need to turn the queue into a generator and sample N trajectories
+            # checking for total_tokens, until sum(total_tokens) > target_tokens_per_batch
+            # then pack and pass to model, and keep the last bach that didnt fit
+            # as the started for the next one
+            # it would be an iterative dataset that yields a batch
+            packed_trajectory = pack_sequences(
+                sequences=trajectories,
+                device=self._device,
+                pad_token_id=self._tokenizer.pad_id,
+                target_tokens_per_batch=self.cfg.target_tokens_per_batch
             )
 
-            masks = generation.get_causal_mask_from_padding_mask(
-                trajectory.query_response_padding_masks
-            )
-            position_ids = generation.get_position_ids_from_padding_mask(
-                trajectory.query_response_padding_masks
-            )
-
-            # Reset GPU memory stats before model_running
-            torch.cuda.reset_peak_memory_stats()
-
-            time_grpo_steps_start = time.perf_counter()
+            #TOOD: need position ids here
             with torch.no_grad():
+                time_model_start = time.perf_counter()
                 ref_logits = self._ref_model(
-                    trajectory.query_responses, input_pos=position_ids, mask=masks
+                    packed_trajectory.tokens,
+                    mask=packed_trajectory.attention_mask,
+                    position_ids=packed_trajectory.position_ids
                 )
-            time_model_running = time.perf_counter() - time_grpo_steps_start
+                time_model_running = time.perf_counter() - time_model_start
+                
+                # get logprobs by calculating CrossEntropyLoss only for the response tokens
+                rep_response_logprobs = self._loss_fn(
+                    ref_logits[packed_trajectory.response_mask],
+                    packed_trajectory.target_tokens,
+                )
+                del ref_logits
+    
+                # Get a list of logprobs
+                ref_logprobs_list = torch.split(rep_response_logprobs.cpu(), packed_trajectory.response_lens)
+                del rep_response_logprobs
 
-            ref_logits = rlhf.truncate_sequence_for_logprobs(ref_logits, context_length)
-            ref_logprobs = rlhf.batched_logits_to_logprobs(
-                ref_logits, trajectory.responses, self._temperature
-            )
+                # Get rewards and successes
+                rewards_by_fn, successes_by_fn, reward_metadata = batched_rewards(
+                    tokenizer=self._tokenizer, 
+                    completions=[t.response_tokens for t in trajectories], 
+                    answers=[t.answer for t in trajectories], 
+                    device='cpu'
+                )
+                #TODO: need to reshape rewards_by_fn and successes_by_fn to match
+                #  the batch/group size that batched rewards expects
 
-            batch_size = self.cfg.vllm.batch_size  # B
-            group_size = self.grpo_samples  # G
+                # Get advantages
+                #TODO: currently this assumes a single group. Need to adjust for multiple groups packed together.
+                # probably need a group_mask
+                group_rewards = rewards_by_fn.sum(-1)
+                mean_reward = group_rewards.mean()
+                std_reward = group_rewards.std().clamp(min=1e-4)
+                advantages = (group_rewards - mean_reward) / std_reward
 
-            del ref_logits, position_ids, masks
-            # masking of ref_logprobs is done in grpo_step
+            # Prepare trajectories for replay buffer
+            scored_trajectories_cpu = []
+            for i, traj in enumerate(trajectories):
+                scored_traj = ScoredTrajectory(
+                    prompt_tokens=traj.prompt_tokens,
+                    response_tokens=traj.response_tokens,
+                    prompt_len=traj.prompt_len,
+                    response_len=traj.response_len,
+                    logprobs=traj.logprobs,
+                    ref_logprobs=ref_logprobs_list[i],
+                    rewards=rewards_by_fn[i],
+                    advantages=advantages[i],
+                    successes=successes_by_fn[i],
+                    answer=traj.answer,
+                    sequence_id=traj.sequence_id,
+                    group_id=traj.group_id,
+                    reward_metadata=reward_metadata,
+                    policy_version=traj.policy_version
+                )
+                scored_trajectories_cpu.append(scored_traj)
 
-            # Extract components from raw trajectory: these have size [B * G, T]
-            print(f"Extracting components from raw trajectory: {trajectory}")
-            query_responses = trajectory.query_responses
-            responses = trajectory.responses
-            query_response_padding_masks = trajectory.query_response_padding_masks
-            seq_lens = trajectory.seq_lens
-            answers = trajectory.answers  # list[str] of len (B * G)
-            answers = [
-                answers[i : i + self.grpo_samples]
-                for i in range(0, len(answers), self.grpo_samples)
-            ]  # list[list[str]] of len [B, G]. Basically a reshape
+            self.replay_buffer.extend(scored_trajectories_cpu)
 
-            # Compute padded tokens percentage
-            total_tokens = query_responses.numel()
-            padded_tokens = (query_responses == self._tokenizer.pad_id).sum().item()
-            padded_tokens_percentage = (
-                (padded_tokens / total_tokens) * 100 if total_tokens > 0 else 0
-            )
-            number_of_tokens = seq_lens.sum().item()
-
-            # Truncate sequences at first stop token
-            (
-                response_padding_masks,
-                responses,
-            ) = rlhf.truncate_sequence_at_first_stop_token(
-                responses,
-                self.STOP_TOKENS_TENSOR.to(self._device),
-                self._tokenizer.pad_id,
-            )
-
-            # Compute rewards
-            responses = responses.reshape(batch_size, group_size, -1)
-            rewards_by_fn, successes_by_fn, reward_metadata = batched_rewards(
-                self._tokenizer, responses, answers, device=self._device
-            )  # These are (B, G, num_funcs)
-
-            # Compute advantages: B, G, num_funcs -> B, G
-            group_rewards = rewards_by_fn.sum(-1)
-
-            # To compute advantage, subtract the mean of the group rewards from each group reward
-            group_advantages = (group_rewards - group_rewards.mean(1, keepdim=True)) / (
-                group_rewards.std(1, keepdim=True) + 1e-4
-            )  # (B, G)
-
-            # Repack trajectory with policy_version
-
-            trajectory = Trajectory(
-                query_responses=trajectory.query_responses,                  # shape: (B*G, P+R)
-                responses=trajectory.responses,                              # shape: (B*G, R)
-                logprobs=trajectory.logprobs,                                # shape: (B*G, R)
-                ref_logprobs=ref_logprobs,                                   # shape: (B*G, R)
-                query_response_padding_masks=trajectory.query_response_padding_masks,  # shape: (B*G, P+R)
-                seq_lens=trajectory.seq_lens,                                # shape: (B*G,)
-                answers=trajectory.answers,                                  # shape: (B*G,)
-                policy_version=trajectory.policy_version,                    # scalar
-                rewards=rewards_by_fn.reshape(
-                    batch_size * group_size, -1
-                ),                                                           # shape: (B*G, num_funcs)
-                advantages=group_advantages.reshape(batch_size * group_size),# shape: (B*G,)
-                successes=successes_by_fn.reshape(
-                    batch_size * group_size, -1
-                ),                                                           # shape: (B*G, num_funcs)
-                reward_metadata=reward_metadata,                             # dict of metadata
-                sequence_ids=trajectory.sequence_ids,                        # shape: (B*G,)
-                # argument for tensor class. Not part of trajectory.
-                batch_size=batch_size * group_size,                          # int
-            )
-
-            log.info(f"Constructed trajectory: {trajectory}")
-            # Move tensors to CPU before putting into the queue
-            trajectory = trajectory.cpu()
-
-            # Update circular queue
-            self.replay_buffer.extend(trajectory)
-
-            # End of step timing
             time_total_ref_step = time.perf_counter() - time_step_start
+            number_of_tokens = sum(traj.response_len for traj in trajectories)
 
-            # Calculate mean rewards and successes for logging
-            rewards_mean_per_func = rewards_by_fn.mean(dim=(0, 1)).cpu()
-            successes_mean_per_func = successes_by_fn.mean(dim=(0, 1)).cpu()
-            rewards_mean = rewards_mean_per_func.mean()
-            successes_mean = successes_mean_per_func.mean()
-            # log metrics
             if self._is_actor_zero:
                 self._log_metrics(
                     step_idx=idx,
+                    grouped_traj=grouped_traj,
                     time_total_ref_step=time_total_ref_step,
                     time_model_running=time_model_running,
                     time_waiting_buffer=time_waiting_buffer,
-                    # TODO: what should we do with this? We can log the total number of elements written in the buffer instead
-                    # full_queue_data_discard=full_queue_data_discard,
                     rollout_queue_size=rollout_queue_size,
-                    rewards_mean=rewards_mean,
-                    successes_mean=successes_mean,
-                    rewards_mean_per_func=rewards_mean_per_func,
-                    successes_mean_per_func=successes_mean_per_func,
+                    rewards_mean=rewards_by_fn.mean(),
+                    successes_mean=successes_by_fn.mean(),
+                    rewards_mean_per_func=rewards_by_fn.mean(dim=0),
+                    successes_mean_per_func=successes_by_fn.mean(dim=0),
                     reward_metadata=reward_metadata,
+                    number_of_tokens=number_of_tokens
                 )
 
-            torch.cuda.empty_cache()
-
             idx += 1
+
+        log.info(f"RefActor {self.actor_id} completed run loop after {idx} steps.")
