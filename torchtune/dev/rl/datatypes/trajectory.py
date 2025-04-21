@@ -100,53 +100,50 @@ class ScoredTrajectory(TensorClass["nocast"]):
 @dataclass
 class PackedTrajectory:
     """
-    Represents a batch of trajectories packed into single tensors for efficient
-    model processing.
+    Represents a batch of trajectories packed into single tensors for efficient model processing.
 
     Attributes:
-        tokens (torch.Tensor): Concatenated prompt and response tokens for all sequences
-            in the batch, potentially padded. Shape: (packed_seq_len,).
-            Example: [P1, R1, P2, R2, ...].
-        attention_mask (torch.Tensor): Block-diagonal causal attention mask for the
-            packed sequences. Shape: (packed_seq_len, packed_seq_len).
+        tokens (torch.Tensor): Concatenated prompt and response tokens for all sequences in the batch,
+            potentially padded. Shape: (packed_seq_len,). Example: [P1, R1, P2, R2, ...].
+        attention_mask (torch.Tensor): Block-diagonal causal attention mask for the packed sequences.
+            Shape: (packed_seq_len, packed_seq_len).
         position_ids (torch.Tensor): Position IDs for the packed sequences. Shape: (packed_seq_len,).
-        response_mask (torch.Tensor): Boolean mask indicating the positions of response
-            tokens within the `tokens` tensor. Shape: (packed_seq_len,).
-        sequence_mask (torch.Tensor): Integer mask indicating which sequence each token
-            belongs to. Shape: (packed_seq_len,).
-        prompt_lens (torch.Tensor): Lengths of the prompts for each sequence in the batch.
-            Shape: (num_sequences,).
-        response_lens (torch.Tensor): Lengths of the responses for each sequence in the
-            batch. Shape: (num_sequences,).
-        sequence_map (torch.Tensor): Start and end indices for each sequence within the
-            `tokens` tensor. Shape: (num_sequences, 2).
-        packed_seq_len (int): The total length of the `tokens` tensor, including any
-            padding.
-        ref_logprobs (Optional[torch.Tensor]): Concatenated reference model log
-            probabilities for all response tokens. Shape: (total_response_tokens,).
-        advantages (Optional[torch.Tensor]): Concatenated advantage values for all
+        response_mask (torch.Tensor): Boolean mask indicating positions of response tokens in `tokens`.
+            Shape: (packed_seq_len,).
+        sequence_mask (torch.Tensor): Integer mask indicating which sequence each token belongs to.
+            Shape: (packed_seq_len,).
+        response_lens (torch.Tensor): Lengths of responses for each sequence. Shape: (num_sequences,).
+        prompt_lens (torch.Tensor): Lengths of prompts for each sequence. Shape: (num_sequences,).
+        pad_count (int): Number of padding tokens in `tokens`.
+        sequence_map (torch.Tensor): Start and end indices for each sequence in `tokens`.
+            Shape: (num_sequences, 2).
+        packed_seq_len (int): Total length of `tokens`, including padding.
+        ref_logprobs (Optional[torch.Tensor]): Concatenated reference model log probabilities for
             response tokens. Shape: (total_response_tokens,).
-        targets (Optional[torch.Tensor]): Concatenated target tokens (usually the
-            response tokens shifted). Shape: (total_response_tokens,).
-        sequence_ids (Optional[List[str]]): List of unique sequence identifiers
-            corresponding to the packed sequences.
-        group_ids (Optional[List[str]]): List of group identifiers corresponding to the
-            packed sequences.
-        actual_total_tokens (int): The total number of tokens in the batch, excluding
-            any padding tokens used in `tokens`.
+        advantages (Optional[torch.Tensor]): Concatenated advantage values for response tokens.
+            Shape: (total_response_tokens,).
+        targets (Optional[torch.Tensor]): Target tokens for loss computation, typically `tokens` shifted
+            by 1, with last token of each sequence and padding set to ignore_index.
+            Shape: (packed_seq_len,).
+        sequence_ids (Optional[List[str]]): Unique identifiers for each sequence.
+        group_ids (Optional[List[str]]): Group identifiers for each sequence.
     """
     tokens: torch.Tensor
     attention_mask: torch.Tensor
     position_ids: torch.Tensor
     response_mask: torch.Tensor
     sequence_mask: torch.Tensor
-    prompt_lens: torch.Tensor
+    
+    # -- helper fields --
     response_lens: torch.Tensor
+    prompt_lens: torch.Tensor
+    pad_count: int
     sequence_map: torch.Tensor
     packed_seq_len: int
+
+    # -- Scored --
     ref_logprobs: Optional[torch.Tensor] = None
     advantages: Optional[torch.Tensor] = None
     targets: Optional[torch.Tensor] = None
     sequence_ids: Optional[List[str]] = None
     group_ids: Optional[List[str]] = None
-    actual_total_tokens: int = 0
