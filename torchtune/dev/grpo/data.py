@@ -14,8 +14,8 @@ from torch.utils.data import Dataset
 from torchtune.data import CROSS_ENTROPY_IGNORE_IDX
 from torchtune.modules.tokenizers import ModelTokenizer
 from torchtune.modules.transforms import Transform
-from torchtune.modules import create_packed_block_causal_mask
-
+from torchtune.modules import packed_block_causal_mask
+from torchtune.dev.rl.datatypes.trajectory import PackedTrajectory, UnscoredTrajectory, ScoredTrajectory
 BASE_PROMPT = (
     "A conversation between User and Assistant. The user asks a question, and the Assistant solves it. "
     "The assistant first thinks about the reasoning process in the mind and then provides the user with the answer. "
@@ -129,8 +129,22 @@ def pack_sequences(
 ) -> PackedTrajectory:
     """Packs Trajectories into a single PackedTrajectory without padding in between sequences.
 
+    For example, for 3 sequences with tokens (Prompt + Response)
+    sequences = [
+        [P1, P2, P3, P4, P5, R1, R2], 
+        [P6, R3],  
+        [P7, P8, R4, R5, R6,]
+    ]
+
+    Instead of padding to match the longest sequence, we concatenate all sequences
+    and add padding tokens to reach target_tokens_per_batch:
+    tokens = [P1, P2, P3, P4, P5, R1, R2, P6, R3, P7, P8, R4, R5, R6, PAD, PAD, PAD]
+
+    Additional masks and tensors are also computed to facilitate efficient processing. For details,
+    check out the docstring of `PackedTrajectory`.
+
     Args:
-        sequences (List[Union[UnscoredTrajectory, ScoredTrajectory]]): Sequences to pack with CPU tensors.
+        sequences (List[Union[UnscoredTrajectory, ScoredTrajectory]]): Sequences to pack.
         pad_token_id (int): Token ID for padding.
         target_tokens_per_batch (Optional[int]): Target token count for padding; if None, no padding added.
         ignore_index (int): Used when generating targets
@@ -144,12 +158,15 @@ def pack_sequences(
     if not sequences:
         raise ValueError("Cannot pack an empty list of sequences.")
 
+    # Extract the device from the first sequence's prompt_tokens
+    device = sequences[0].prompt_tokens.device
+
     num_sequences = len(sequences)
     is_scored = isinstance(sequences[0], ScoredTrajectory)
     
     # Calculate lengths
-    prompt_lens = torch.tensor([s.prompt_len for s in sequences], dtype=torch.long)
-    response_lens = torch.tensor([s.response_len for s in sequences], dtype=torch.long)
+    prompt_lens = torch.tensor([s.prompt_len for s in sequences], dtype=torch.long, device=device)
+    response_lens = torch.tensor([s.response_len for s in sequences], dtype=torch.long, device=device)
     total_lens = prompt_lens + response_lens
     packed_seq_len_no_padding = total_lens.sum().item()
     
@@ -165,7 +182,7 @@ def pack_sequences(
     total_lens_padded = total_lens.clone()
     if target_tokens_per_batch and packed_seq_len_no_padding < target_tokens_per_batch:
         pad_count = target_tokens_per_batch - packed_seq_len_no_padding
-        padding = torch.full((pad_count,), pad_token_id, dtype=torch.long)
+        padding = torch.full((pad_count,), pad_token_id, dtype=torch.long, device=device)
         tokens_list.append(padding)
 
         # Pad total length so generate masks with the correct shape
@@ -177,16 +194,16 @@ def pack_sequences(
     
     # Sequence map
     cumsum_lens = total_lens.cumsum(dim=0)
-    sequence_map = torch.zeros((num_sequences, 2), dtype=torch.long)
+    sequence_map = torch.zeros((num_sequences, 2), dtype=torch.long, device=device)
     sequence_map[1:, 0] = cumsum_lens[:-1]
     sequence_map[:, 1] = cumsum_lens
     sequence_map = sequence_map
     
     # Attention Mask
-    attention_mask = create_packed_block_causal_mask(total_lens_padded)
+    attention_mask = packed_block_causal_mask(total_lens_padded).to(device=device)
 
     # Sequence Mask
-    sequence_mask = torch.repeat_interleave(torch.arange(num_sequences), total_lens_padded)
+    sequence_mask = torch.repeat_interleave(torch.arange(num_sequences, device=device), total_lens_padded)
 
     # Response Mask
     # E.g., sequences [P1, R1, P2, P2, R2, P3, R3, PAD]
@@ -195,13 +212,13 @@ def pack_sequences(
     # E.g., sequence_mask=[0,0,1,1,1,2,2], response_start_per_token=[1,1,4,4,4,6,6]
     response_start_per_token = response_start[sequence_mask]
     # E.g., arange=[0,1,2,3,4,5,6,7], response_mask=[F,T,F,F,T,F,T,F]
-    response_mask = torch.arange(packed_seq_len_padded) >= response_start_per_token
+    response_mask = torch.arange(packed_seq_len_padded, device=device) >= response_start_per_token
     # E.g., pad_count=1, response_mask unchanged=[F,T,F,F,T,F,T,F]
     response_mask[-pad_count:] = False
 
     # create position ids
     start_per_token = sequence_map[sequence_mask, 0] # e.g. 0, 0, 0, 0, 1, 1, 2, 2, 2, 2
-    position_ids = torch.arange(packed_seq_len_padded) - start_per_token # 0, 1, 2, 0, 1, 0, 1, 2, 3   
+    position_ids = torch.arange(packed_seq_len_padded, device=device) - start_per_token # 0, 1, 2, 0, 1, 0, 1, 2, 3   
 
     # Pack additional fields for scored trajectories
     ref_logprobs = advantages = targets = None
