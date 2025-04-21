@@ -799,6 +799,14 @@ class PyTorchActorModel:
         self._optimizer.zero_grad()
         self._profiler.start()
 
+        # Initialize dataset
+        dataset = RLPackedDataset(
+            source=QueueSource(self.rollout_queue),
+            target_tokens_per_batch=self.cfg.target_tokens_per_batch,
+            pad_token_id=self._tokenizer.pad_id,
+            device=self._device
+        )
+
         while self._steps_run < self._total_dialog_turns:
 
             # Memory profiling start
@@ -820,19 +828,8 @@ class PyTorchActorModel:
                 log.info("waiting for replay buffer")
                 time.sleep(1.0)
 
-            trajectories = self.replay_buffer.sample().to(self._device)
-
-            #TODO: need to turn the replaybuffer into a generator and sample N trajectories
-            # checking for total_tokens, until sum(total_tokens) > target_tokens_per_batch
-            # then pack and pass to model, and keep the last bach that didnt fit
-            # as the started for the next one
-            # it would be an iterative dataset that yields a batch
-            packed_trajectory = pack_sequences(
-                sequences=trajectories,
-                device=self._device,
-                pad_token_id=self._tokenizer.pad_id,
-                target_tokens_per_batch=self.cfg.target_tokens_per_batch
-            )
+            packed_trajectory = next(dataset)
+            #TODO: unpacked trajectories is not exposed anymore.
 
             time_waiting_buffer = time.perf_counter() - time_waiting_buffer_start
             if self._is_rank_zero:

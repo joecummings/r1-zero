@@ -194,22 +194,21 @@ class RefActor:
 
         log.info(f"RefActor {self.actor_id} starting run loop.")
         idx = 0
+
+        # Initialize dataset
+        dataset = RLPackedDataset(
+            source=QueueSource(self.rollout_queue),
+            target_tokens_per_batch=self.cfg.target_tokens_per_batch,
+            pad_token_id=self._tokenizer.pad_id,
+            device=self._device
+        )
+        
         while idx < self.cfg.num_steps:
             time_step_start = time.perf_counter()
             rollout_queue_size = self.rollout_queue.qsize() if self._is_actor_zero else -1
 
-            #TODO: replace with generator
-            try:
-                grouped_traj = self.rollout_queue.get(block=True, timeout=1.0)
-                grouped_traj = self._move_to_device(grouped_traj)
-            except ray.util.queue.Empty:
-                log.debug(f"RefActor {self.actor_id} rollout queue empty, sleeping.")
-                time.sleep(1.0)
-                continue
-            except Exception as e:
-                log.error(f"RefActor {self.actor_id} error getting from queue: {e}")
-                time.sleep(1.0)
-                continue
+            packed_trajectory = next(dataset)
+            #TODO: unpacked trajectories is not exposed anymore.
 
             time_wait_end = time.perf_counter()
             time_waiting_buffer = time_wait_end - time_step_start
