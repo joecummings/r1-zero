@@ -120,9 +120,72 @@ def padded_collate_rl(
 
     return {"tokens": input_ids.long(), "answers": answers, "text": text}
 
+class TrajectorySource(Iterator):
+    @abstractmethod
+    def __next__(self) -> Union['GroupedUnscoredTrajectories', 'ScoredTrajectory']:
+        pass
 
+class QueueSource(TrajectorySource):
+    def __init__(self, queue):
+        self.queue = queue
+
+    def __next__(self):
+        while True:
+            try:
+                return self.queue.get(block=True, timeout=1.0)
+            except Empty:
+                time.sleep(1.0)
+                log.info("Waiting for queue to fill...")
+
+class ReplayBufferSource(TrajectorySource):
+    def __init__(self, replay_buffer):
+        self.replay_buffer = replay_buffer
+
+    def __next__(self):
+        while len(self.replay_buffer) == 0:
+            time.sleep(1.0)
+            log.info("Waiting for replay buffer to fill...")
+
+        return self.replay_buffer.sample(1)[0]  # Sample with bsz=1
+
+class RLPackedDataset(Iterator):
+    def __init__(self, source: TrajectorySource, target_tokens_per_batch: int, pad_token_id: int, device: torch.device):
+        self.source = source
+        self.target_tokens_per_batch = target_tokens_per_batch
+        self.pad_token_id = pad_token_id
+        self.device = device
+        self.accumulated_trajectories = []
+        self.accumulated_tokens = 0
+
+    def __next__(self):
+        while True:
+            item = next(self.source)
+            if isinstance(item, GroupedUnscoredTrajectories):
+                trajectories = item.trajectories
+                tokens_in_group = item.total_tokens  # Use total_tokens for group
+            else:  # ScoredTrajectory
+                trajectories = [item]
+                tokens_in_group = item.prompt_len + item.response_len
+
+            # Accumulate trajectories
+            self.accumulated_trajectories.extend(trajectories)
+            self.accumulated_tokens += tokens_in_group
+
+            # Pack entire groups together, yield when token threshold is met
+            if self.accumulated_tokens >= self.target_tokens_per_batch:
+                packed = pack_sequences(
+                    sequences=self.accumulated_trajectories,
+                    pad_token_id=self.pad_token_id,
+                    target_tokens_per_batch=self.target_tokens_per_batch,
+                    device=self.device
+                )
+                self.accumulated_trajectories = []
+                self.accumulated_tokens = 0
+                return packed
+            
 def pack_sequences(
     sequences: List[Union[UnscoredTrajectory, ScoredTrajectory]],
+    device: torch.device,
     pad_token_id: int,
     target_tokens_per_batch: Optional[int] = None,
     ignore_index: int = -100
@@ -145,6 +208,7 @@ def pack_sequences(
 
     Args:
         sequences (List[Union[UnscoredTrajectory, ScoredTrajectory]]): Sequences to pack.
+        device (torch.device): Device to place tensors on.
         pad_token_id (int): Token ID for padding.
         target_tokens_per_batch (Optional[int]): Target token count for padding; if None, no padding added.
         ignore_index (int): Used when generating targets
@@ -153,13 +217,10 @@ def pack_sequences(
         PackedTrajectory: Packed batch of sequences.
 
     Example:
-        packed = pack_sequences(sequences, 'cuda', 0, target_tokens_per_batch=4096)
+        packed = pack_sequences(sequences, torch.device('cuda'), 0, target_tokens_per_batch=4096)
     """
     if not sequences:
         raise ValueError("Cannot pack an empty list of sequences.")
-
-    # Extract the device from the first sequence's prompt_tokens
-    device = sequences[0].prompt_tokens.device
 
     num_sequences = len(sequences)
     is_scored = isinstance(sequences[0], ScoredTrajectory)
@@ -184,7 +245,6 @@ def pack_sequences(
         pad_count = target_tokens_per_batch - packed_seq_len_no_padding
         padding = torch.full((pad_count,), pad_token_id, dtype=torch.long, device=device)
         tokens_list.append(padding)
-
         # Pad total length so generate masks with the correct shape
         total_lens_padded[-1] += pad_count
         packed_seq_len_padded = target_tokens_per_batch
@@ -216,9 +276,21 @@ def pack_sequences(
     # E.g., pad_count=1, response_mask unchanged=[F,T,F,F,T,F,T,F]
     response_mask[-pad_count:] = False
 
+    # Group Mask
+    group_mask = torch.zeros(len(sequences), device=device)
+    prev_group_id = sequences[0].group_id
+    int_group_id = 0
+    for i, seq in enumerate(sequences):
+        if seq.group_id != prev_group_id:
+            int_group_id += 1
+            group_mask[i] = int_group_id
+            prev_group_id = seq.group_id
+        else:
+            group_mask[i] = int_group_id
+   
     # create position ids
-    start_per_token = sequence_map[sequence_mask, 0] # e.g. 0, 0, 0, 0, 1, 1, 2, 2, 2, 2
-    position_ids = torch.arange(packed_seq_len_padded, device=device) - start_per_token # 0, 1, 2, 0, 1, 0, 1, 2, 3   
+    start_per_token = sequence_map[sequence_mask, 0]
+    position_ids = torch.arange(packed_seq_len_padded, device=device) - start_per_token
 
     # Pack additional fields for scored trajectories
     ref_logprobs = advantages = targets = None
@@ -228,14 +300,11 @@ def pack_sequences(
         advantages = torch.repeat_interleave(adv_values, response_lens)
 
         # -- Create targets --
-        # Extract response tokens and shift them to create targets
         targets = tokens[response_mask]
         targets[:-1] = targets[1:]
-
+        
         # Find the indices of the last response token in each sequence
-        last_response_indices = response_lens.cumsum(dim=0)
-        last_response_indices = last_response_indices - 1  # shift
-
+        last_response_indices = response_lens.cumsum(dim=0) - 1 # shift by 1
         # Set the last token of each sequence to ignore_index
         targets[last_response_indices] = ignore_index
 
@@ -245,6 +314,7 @@ def pack_sequences(
     assert position_ids.shape == (packed_seq_len_padded,), f"Position IDs shape mismatch. Expected: {packed_seq_len_padded}, Actual: {position_ids.shape}"
     assert response_mask.shape == (packed_seq_len_padded,), f"Response mask shape mismatch. Expected: {packed_seq_len_padded}, Actual: {response_mask.shape}"
     assert sequence_mask.shape == (packed_seq_len_padded,), f"Sequence mask shape mismatch. Expected: {packed_seq_len_padded}, Actual: {sequence_mask.shape}"
+    assert group_mask.shape == (packed_seq_len_padded,), f"Group mask shape mismatch. Expected: {packed_seq_len_padded}, Actual: {group_mask.shape}"
 
     if is_scored:
         total_response_tokens = response_lens.sum().item()
@@ -258,6 +328,7 @@ def pack_sequences(
         position_ids=position_ids,
         response_mask=response_mask,
         sequence_mask=sequence_mask,
+        group_mask=group_mask,
         prompt_lens=prompt_lens,
         response_lens=response_lens,
         sequence_map=sequence_map,

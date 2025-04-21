@@ -112,6 +112,8 @@ class PackedTrajectory:
             Shape: (packed_seq_len,).
         sequence_mask (torch.Tensor): Integer mask indicating which sequence each token belongs to.
             Shape: (packed_seq_len,).
+        group_mask (torch.Tensor): Integer mask indicating which group each sequence belongs to.
+            Shape: (packed_seq_len,).
         response_lens (torch.Tensor): Lengths of responses for each sequence. Shape: (num_sequences,).
         prompt_lens (torch.Tensor): Lengths of prompts for each sequence. Shape: (num_sequences,).
         pad_count (int): Number of padding tokens in `tokens`.
@@ -133,6 +135,7 @@ class PackedTrajectory:
     position_ids: torch.Tensor
     response_mask: torch.Tensor
     sequence_mask: torch.Tensor
+    group_mask: torch.Tensor
     
     # -- helper fields --
     response_lens: torch.Tensor

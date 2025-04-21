@@ -257,12 +257,15 @@ class RefActor:
                 )
 
                 def compute_advantages(packed_trajectory: PackedTrajectory, rewards_by_fn: torch.Tensor):
+                    """
+                    Assumes rewards_by_fn have shape (self.cfg.grpo_samples*num_groups, ...)
+                    """
                     #TODO: this relies a lot on order of trajectories in the batch
                     # This may be safe, but its a big assumption and may break silenly.
                     
                     assert rewards_by_fn.shape[0] % self.cfg.grpo_samples == 0, "rewards_by_fn must have shape[0] divisible by grpo_samples"
 
-                    group_indices = packed_trajectory.group_indices
+                    group_indices = packed_trajectory.group_mask
                     group_counts = self.cfg.grpo_samples
                     num_groups = rewards_by_fn.shape[0] // group_counts
 
