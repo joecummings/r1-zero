@@ -135,7 +135,6 @@ class QueueSource(TrajectorySource):
                 return self.queue.get(block=True, timeout=1.0)
             except Empty:
                 time.sleep(1.0)
-                log.info("Waiting for queue to fill...")
 
 class ReplayBufferSource(TrajectorySource):
     def __init__(self, replay_buffer):
@@ -144,10 +143,9 @@ class ReplayBufferSource(TrajectorySource):
     def __next__(self):
         while len(self.replay_buffer) == 0:
             time.sleep(1.0)
-            log.info("Waiting for replay buffer to fill...")
-
         return self.replay_buffer.sample(1)[0]  # Sample with bsz=1
 
+#TODO: review this
 class RLPackedDataset(Iterator):
     def __init__(self, source: TrajectorySource, target_tokens_per_batch: int, pad_token_id: int, device: torch.device):
         self.source = source
@@ -167,17 +165,31 @@ class RLPackedDataset(Iterator):
                 trajectories = [item]
                 tokens_in_group = item.prompt_len + item.response_len
 
-            # Accumulate trajectories
-            self.accumulated_trajectories.extend(trajectories)
-            self.accumulated_tokens += tokens_in_group
-
-            # Pack entire groups together, yield when token threshold is met
-            if self.accumulated_tokens >= self.target_tokens_per_batch:
+            # Check if adding this group exceeds target_tokens_per_batch
+            if self.accumulated_tokens + tokens_in_group > self.target_tokens_per_batch and self.accumulated_trajectories:
+                # Pack accumulated trajectories without the new item
                 packed = pack_sequences(
                     sequences=self.accumulated_trajectories,
+                    device=self.device,
                     pad_token_id=self.pad_token_id,
-                    target_tokens_per_batch=self.target_tokens_per_batch,
-                    device=self.device
+                    target_tokens_per_batch=self.target_tokens_per_batch
+                )
+                # Keep the new item for the next batch
+                self.accumulated_trajectories = trajectories
+                self.accumulated_tokens = tokens_in_group
+                return packed
+            else:
+                # Accumulate trajectories
+                self.accumulated_trajectories.extend(trajectories)
+                self.accumulated_tokens += tokens_in_group
+
+            # Pack entire groups together, yield when token threshold is met
+            if self.accumulated_tokens >= self.target_tokens_per_batch or self.accumulated_trajectories:
+                packed = pack_sequences(
+                    sequences=self.accumulated_trajectories,
+                    device=self.device,
+                    pad_token_id=self.pad_token_id,
+                    target_tokens_per_batch=self.target_tokens_per_batch
                 )
                 self.accumulated_trajectories = []
                 self.accumulated_tokens = 0
