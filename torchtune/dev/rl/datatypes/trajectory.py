@@ -113,7 +113,7 @@ class PackedTrajectory:
         sequence_mask (torch.Tensor): Integer mask indicating which sequence each token belongs to.
             Shape: (packed_seq_len,).
         group_mask (torch.Tensor): Integer mask indicating which group each sequence belongs to.
-            Shape: (packed_seq_len,).
+            Shape: (num_sequences,).
         response_lens (torch.Tensor): Lengths of responses for each sequence. Shape: (num_sequences,).
         prompt_lens (torch.Tensor): Lengths of prompts for each sequence. Shape: (num_sequences,).
         pad_count (int): Number of padding tokens in `tokens`.
@@ -127,8 +127,7 @@ class PackedTrajectory:
         targets (Optional[torch.Tensor]): Target tokens for loss computation, typically `tokens` shifted
             by 1, with last token of each sequence and padding set to ignore_index.
             Shape: (packed_seq_len,).
-        sequence_ids (Optional[List[str]]): Unique identifiers for each sequence.
-        group_ids (Optional[List[str]]): Group identifiers for each sequence.
+        sequence_ids (Optional[List[str]]): Unique identifiers for each sequence. Shape: (num_sequences,)
     """
     tokens: torch.Tensor
     attention_mask: torch.Tensor
@@ -149,4 +148,3 @@ class PackedTrajectory:
     advantages: Optional[torch.Tensor] = None
     targets: Optional[torch.Tensor] = None
     sequence_ids: Optional[List[str]] = None
-    group_ids: Optional[List[str]] = None
