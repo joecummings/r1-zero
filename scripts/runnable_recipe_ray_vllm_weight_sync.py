@@ -250,6 +250,12 @@ class RayGRPORecipe:
             actor_options={"num_cpus": 10, "num_gpus": 0},
             maxsize=self.cfg.vllm.queue_maxsize,
         )
+
+        # avoid sampling with replacement
+        assert (
+            cfg.replay_buffer_size >= cfg.batch_size
+        ), f"Found {cfg.replay_buffer_size=} < {cfg.batch_size=}."
+
         self.replay_buffer = RayReplayBuffer(
             storage=functools.partial(
                 LazyStackStorage, max_size=cfg.replay_buffer_size

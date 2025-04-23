@@ -21,7 +21,6 @@
 #  sbatch multinode_grpo.sbatch
 
 name: grpo_qwen3b
-total_inference_batch_size: ${eval:'${vllm.batch_size} * ${grpo_samples}'}
 
 output_dir: /tmp/checkpoints/${name}
 base_model_path: /tmp/Qwen2.5-3B  # Use this to train from the slightly trained SFT model
@@ -72,12 +71,12 @@ resume_from_checkpoint: False
 save_every_n_epochs: 1
 
 # Fine-tuning arguments
-batch_size: 16
-grpo_samples: 16
+batch_size: 32 # how many samples are sampled from the replay_buffer by PyTorchActorModel
+grpo_samples: 4 # used in LLMCollector, RefActor, and PyTorchActorModel
 max_generated_tokens: 512
 top_k: null
 temperature: 1.0
-replay_buffer_size: ${total_inference_batch_size}  # TODO this needs to be fixed. Right now this can't be bigger, or else we'll get padding issues
+replay_buffer_size: ${eval:'${batch_size} * 5'}
 
 ppo_epochs: 1
 
@@ -117,7 +116,7 @@ num_fsdp_workers: 2
 vllm:
   num_workers: 4
   tp_size: 1
-  batch_size: 1
+  batch_size: 1 # number of unique prompts per batch. Use `grpo_samples` to control # of samples per prompt.
   steps_before_sync: 1
   queue_maxsize: ${eval:'${vllm.num_workers} * ${steps_before_sync}'}
 
@@ -130,7 +129,7 @@ log_every_n_steps: 1
 log_peak_memory_stats: True
 
 debug_logging_enabled: True
-debug_num_samples_per_step: 1
+debug_num_samples_per_step: 4
 
 # Profiler (disabled)
 profiler:
