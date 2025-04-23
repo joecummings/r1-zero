@@ -214,18 +214,6 @@ class RefActor:
             time_waiting_buffer = time_wait_end - time_step_start
             trajectories = grouped_traj.trajectories
 
-            #TODO: need to turn the queue into a generator and sample N trajectories
-            # checking for total_tokens, until sum(total_tokens) > target_tokens_per_batch
-            # then pack and pass to model, and keep the last bach that didnt fit
-            # as the started for the next one
-            # it would be an iterative dataset that yields a batch
-            packed_trajectory = pack_sequences(
-                sequences=trajectories,
-                device=self._device,
-                pad_token_id=self._tokenizer.pad_id,
-                target_tokens_per_batch=self.cfg.target_tokens_per_batch
-            )
-
             #TOOD: need position ids here
             with torch.no_grad():
                 time_model_start = time.perf_counter()
@@ -248,6 +236,7 @@ class RefActor:
                 del rep_response_logprobs
 
                 # Get rewards and successes
+                # shape (num_groups*samples_grpo, num_functions)
                 rewards_by_fn, successes_by_fn, reward_metadata = batched_rewards(
                     tokenizer=self._tokenizer, 
                     completions=[t.response_tokens for t in trajectories], 

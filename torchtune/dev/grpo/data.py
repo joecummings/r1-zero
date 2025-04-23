@@ -330,7 +330,7 @@ def pack_sequences(
     assert position_ids.shape == (packed_seq_len_padded,), f"Position IDs shape mismatch. Expected: {packed_seq_len_padded}, Actual: {position_ids.shape}"
     assert response_mask.shape == (packed_seq_len_padded,), f"Response mask shape mismatch. Expected: {packed_seq_len_padded}, Actual: {response_mask.shape}"
     assert sequence_mask.shape == (packed_seq_len_padded,), f"Sequence mask shape mismatch. Expected: {packed_seq_len_padded}, Actual: {sequence_mask.shape}"
-    assert group_mask.shape == (packed_seq_len_padded,), f"Group mask shape mismatch. Expected: {packed_seq_len_padded}, Actual: {group_mask.shape}"
+    assert group_mask.shape == (num_sequences,), f"Group mask shape mismatch. Expected: {num_sequences}, Actual: {group_mask.shape}"
 
     if is_scored:
         total_response_tokens = response_lens.sum().item()
