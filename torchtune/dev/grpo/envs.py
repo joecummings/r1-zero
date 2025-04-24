@@ -1,4 +1,10 @@
 # Copyright (c) Meta Platforms, Inc. and affiliates.
+# All rights reserved.
+#
+# This source code is licensed under the BSD-style license found in the
+# LICENSE file in the root directory of this source tree.
+
+# Copyright (c) Meta Platforms, Inc. and affiliates.
 #
 # This source code is licensed under the MIT license found in the
 # LICENSE file in the root directory of this source tree.
@@ -11,7 +17,13 @@ from typing import Any, Callable, Iterable, Literal
 
 import torch
 from tensordict import (
-    LazyStackedTensorDict, NestedKey, TensorDict, TensorDictBase, is_leaf_nontensor, lazy_stack, unravel_key,
+    is_leaf_nontensor,
+    lazy_stack,
+    LazyStackedTensorDict,
+    NestedKey,
+    TensorDict,
+    TensorDictBase,
+    unravel_key,
 )
 from tensordict.tensorclass import NonTensorData, NonTensorStack
 from tensordict.utils import _zip_strict
@@ -46,7 +58,7 @@ def as_nested_tensor(list_of_tensordicts: list[TensorDictBase]) -> TensorDictBas
 
 
 def as_padded_tensor(
-        list_of_tensordicts: list[[TensorDictBase]], dim=0, stack_dim: int = 0
+    list_of_tensordicts: list[[TensorDictBase]], dim=0, stack_dim: int = 0
 ) -> TensorDictBase:
     """Stacks a list of tensordicts into a single tensordict with padded tensors.
 
@@ -66,7 +78,9 @@ def as_padded_tensor(
 
         def pad_tensor(tensor):
             padding_length = max_length - tensor.size(dim)
-            shape = [s if i != dim else padding_length for i, s in enumerate(tensor.shape)]
+            shape = [
+                s if i != dim else padding_length for i, s in enumerate(tensor.shape)
+            ]
             return torch.cat((tensor.new_zeros(shape), tensor), dim=dim)
 
         return torch.stack([pad_tensor(t) for t in list_of_tensors], dim=stack_dim)
@@ -347,15 +361,18 @@ class DataLoadingPrimer(TensorDictPrimer):
     """
 
     def __init__(
-            self,
-            dataloader: Iterable[dict[str, Any]],
-            *,
-            primers: Composite | None = None,
-            stack_method: Callable[[Any], Any] | Literal["as_nested_tensor", "as_padded_tensor"] | None = None,
-            batch_size: int | torch.Size | None = None,
-            repeats: int | None = None,
-            device: torch.device | None = None,
-            group_repeats: bool = False, ):
+        self,
+        dataloader: Iterable[dict[str, Any]],
+        *,
+        primers: Composite | None = None,
+        stack_method: Callable[[Any], Any]
+        | Literal["as_nested_tensor", "as_padded_tensor"]
+        | None = None,
+        batch_size: int | torch.Size | None = None,
+        repeats: int | None = None,
+        device: torch.device | None = None,
+        group_repeats: bool = False,
+    ):
         self.dataloader = dataloader
         if repeats is None:
             repeats = 0
@@ -440,7 +457,8 @@ class DataLoadingPrimer(TensorDictPrimer):
             expand_specs=None,
             single_default_value=True,
             call_before_env_reset=True,
-            device=device, )
+            device=device,
+        )
         self._reset_key = "_reset"
 
     @classmethod
@@ -481,7 +499,8 @@ class DataLoadingPrimer(TensorDictPrimer):
                 data,
                 auto_batch_size=self.auto_batch_size,
                 batch_dims=int(bool(self.auto_batch_size or self.batch_size)),
-                device=device, )
+                device=device,
+            )
         else:
             raise TypeError(
                 "Data loader must return a mapping that can be automatically cast to a tensordict. Check that you have "
@@ -499,7 +518,11 @@ class DataLoadingPrimer(TensorDictPrimer):
         result = super().set_container(container)
         # Check batch size
         parent = getattr(self, "parent", None)
-        if (self.batch_size is not None and parent is not None and parent.batch_size != self.batch_size):
+        if (
+            self.batch_size is not None
+            and parent is not None
+            and parent.batch_size != self.batch_size
+        ):
             warnings.warn(
                 f"The parent env has a different batch size than the {type(self).__name__} transform."
             )
@@ -574,23 +597,24 @@ class LLMEnv(EnvBase):
     _DEFAULT_ACTION_STR_KEY = "text_response"
 
     def __init__(
-            self,
-            *,
-            token_key: NestedKey | None = None,
-            str_key: NestedKey | None = None,
-            attention_key: NestedKey | None = None,
-            action_key: NestedKey | None = None,
-            reward_key: NestedKey = "reward",
-            from_text: bool = True,
-            device: torch.device | None = None,
-            vocab_size: int | None = None,
-            assign_reward: bool = False,
-            assign_done: bool = False,
-            batch_size: int | torch.Size | None = None,
-            has_attention: bool = True,
-            # Experimental
-            as_llm_data: bool = False,
-            eos_token_id: int | None = None, ) -> None:
+        self,
+        *,
+        token_key: NestedKey | None = None,
+        str_key: NestedKey | None = None,
+        attention_key: NestedKey | None = None,
+        action_key: NestedKey | None = None,
+        reward_key: NestedKey = "reward",
+        from_text: bool = True,
+        device: torch.device | None = None,
+        vocab_size: int | None = None,
+        assign_reward: bool = False,
+        assign_done: bool = False,
+        batch_size: int | torch.Size | None = None,
+        has_attention: bool = True,
+        # Experimental
+        as_llm_data: bool = False,
+        eos_token_id: int | None = None,
+    ) -> None:
         self.as_llm_data = as_llm_data
         if token_key is None:
             token_key = self._DEFAULT_TOKEN_KEY
@@ -614,7 +638,9 @@ class LLMEnv(EnvBase):
                     f"batch-size of LLMEnv must be 0 or 1d. Got batch_size={batch_size}."
                 )
         super().__init__(
-            device=device, batch_size=batch_size, )
+            device=device,
+            batch_size=batch_size,
+        )
         self.has_attention = has_attention
         self.from_text = from_text
         self.vocab_size = vocab_size
@@ -630,14 +656,20 @@ class LLMEnv(EnvBase):
             warnings.warn(
                 "eos_token_id is missing. This means that the environment will not be able to capture its "
                 "done state automatically. This may lead to undefined behaviors when the generated text reaches "
-                "an eos_token.", category=UserWarning, )
+                "an eos_token.",
+                category=UserWarning,
+            )
 
         # self.action_key = unravel_key(action_key)
         if from_text:
             self.full_observation_spec_unbatched = Composite(
                 {
                     self.str_key: NonTensor(
-                        example_data="a string", batched=True, shape=(), device=device, )
+                        example_data="a string",
+                        batched=True,
+                        shape=(),
+                        device=device,
+                    )
                 }
             )
             self.full_action_spec_unbatched = Composite(
@@ -668,13 +700,23 @@ class LLMEnv(EnvBase):
                 self.full_observation_spec_unbatched = Composite(
                     {
                         token_key: Bounded(
-                            shape=(-1,), dtype=torch.int64, low=0, high=vocab_size, device=device, )
+                            shape=(-1,),
+                            dtype=torch.int64,
+                            low=0,
+                            high=vocab_size,
+                            device=device,
+                        )
                     }
                 )
                 self.full_action_spec_unbatched = Composite(
                     {
                         action_key: Bounded(
-                            shape=(-1,), dtype=torch.int64, low=0, high=vocab_size, device=device, )
+                            shape=(-1,),
+                            dtype=torch.int64,
+                            low=0,
+                            high=vocab_size,
+                            device=device,
+                        )
                     }
                 )
         STR2STR_ERR = ValueError(
@@ -694,7 +736,8 @@ class LLMEnv(EnvBase):
             # Use single done
             self.full_done_spec_unbatched = Composite(
                 done=Unbounded(shape=(1,), dtype=torch.bool, device=device),
-                terminated=Unbounded(shape=(1,), dtype=torch.bool, device=device), )
+                terminated=Unbounded(shape=(1,), dtype=torch.bool, device=device),
+            )
         elif self.from_text:
             raise STR2STR_ERR
         else:
@@ -702,35 +745,39 @@ class LLMEnv(EnvBase):
             self.full_done_spec_unbatched = Composite(
                 tokens_data=Composite(
                     done=Unbounded(shape=(-1,), dtype=torch.bool, device=device),
-                    terminated=Unbounded(shape=(-1,), dtype=torch.bool, device=device), ),
+                    terminated=Unbounded(shape=(-1,), dtype=torch.bool, device=device),
+                ),
                 done=Unbounded(shape=(1,), dtype=torch.bool, device=device),
-                terminated=Unbounded(shape=(1,), dtype=torch.bool, device=device), )
+                terminated=Unbounded(shape=(1,), dtype=torch.bool, device=device),
+            )
 
     @classmethod
     def from_dataloader(
-            cls,
-            dataloader: DataLoader,
-            *,
-            tokenizer: transformers.PretrainedTokenizerBase | None = None,
-            # noqa
-            token_key: NestedKey | None = None,
-            str_key: NestedKey | None = None,
-            attention_key: NestedKey | None = None,
-            action_key: NestedKey | None = None,
-            reward_key: NestedKey = "reward",
-            from_text: bool = True,
-            device: torch.device | None = None,
-            vocab_size: int | None = None,
-            batch_size: int | torch.Size | None = None,
-            has_attention: bool = True,
-            assign_reward: bool = False,
-            assign_done: bool = False,
-            primers: Composite | None = None,
-            example_data: Any = None,
-            stack_method: Callable[[Any], Any] | Literal["as_nested_tensor", "as_padded_tensor"] = None,
-            repeats: int | None = None,
-            group_repeats: bool = True,
-            eos_token_id: int | None = None, ) -> LLMEnv:
+        cls,
+        dataloader: DataLoader,
+        *,
+        tokenizer: transformers.PretrainedTokenizerBase | None = None,
+        # noqa
+        token_key: NestedKey | None = None,
+        str_key: NestedKey | None = None,
+        attention_key: NestedKey | None = None,
+        action_key: NestedKey | None = None,
+        reward_key: NestedKey = "reward",
+        from_text: bool = True,
+        device: torch.device | None = None,
+        vocab_size: int | None = None,
+        batch_size: int | torch.Size | None = None,
+        has_attention: bool = True,
+        assign_reward: bool = False,
+        assign_done: bool = False,
+        primers: Composite | None = None,
+        example_data: Any = None,
+        stack_method: Callable[[Any], Any]
+        | Literal["as_nested_tensor", "as_padded_tensor"] = None,
+        repeats: int | None = None,
+        group_repeats: bool = True,
+        eos_token_id: int | None = None,
+    ) -> LLMEnv:
         """Creates an LLMEnv instance from a dataloader.
 
         This method creates an LLMEnv instance and appends a DataLoadingPrimer to it, which populates ``data_keys`` (by default ``observation_key``) with data from the provided dataloader when the environment is reset.
@@ -804,7 +851,7 @@ class LLMEnv(EnvBase):
         if attention_key is None:
             attention_key = LLMEnv._DEFAULT_ATTENTION_KEY
         elif tokenizer is not None and attention_key != _replace_last(
-                token_key, "attention_mask"
+            token_key, "attention_mask"
         ):
             raise ValueError(
                 "When using the Tokenizer, attention key must match `(*token_key[:-1], 'attention_mask')` where "
@@ -826,7 +873,8 @@ class LLMEnv(EnvBase):
                     out_keys_inv=[cls._DEFAULT_ACTION_TOKENS_KEY],
                     call_before_reset=False,
                     # We should always see the required entries
-                    missing_tolerance=False, )
+                    missing_tolerance=False,
+                )
             else:
                 # FIXME: This is broken - do we need it anyway?
                 raise RuntimeError(
@@ -840,7 +888,8 @@ class LLMEnv(EnvBase):
             repeats=repeats,
             device=device,
             group_repeats=group_repeats,
-            batch_size=batch_size, )
+            batch_size=batch_size,
+        )
         env = LLMEnv(
             from_text=from_text,
             device=device,
@@ -854,7 +903,8 @@ class LLMEnv(EnvBase):
             assign_done=assign_done,
             batch_size=primer.batch_size,
             has_attention=has_attention,
-            eos_token_id=eos_token_id, )
+            eos_token_id=eos_token_id,
+        )
         if tokenizer is not None:
             env = env.append_transform(tokenizer_transform)
         return env.append_transform(primer)
@@ -868,7 +918,9 @@ class LLMEnv(EnvBase):
         return NonTensorData(obs + action, device=device)
 
     def _step(
-            self, tensordict: TensorDictBase, ) -> TensorDictBase:
+        self,
+        tensordict: TensorDictBase,
+    ) -> TensorDictBase:
         next_td = tensordict.empty()
         self._make_next_obs(tensordict, next_td)
         self._maybe_make_reward(tensordict, next_td)
@@ -878,17 +930,23 @@ class LLMEnv(EnvBase):
         return next_td
 
     def _maybe_make_reward(
-            self, tensordict: TensorDictBase, next_td: TensorDictBase
+        self, tensordict: TensorDictBase, next_td: TensorDictBase
     ) -> TensorDictBase:
         if self.assign_reward:
             next_td.set(
-                self.reward_key, torch.zeros_like(
+                self.reward_key,
+                torch.zeros_like(
                     tensordict.get(self.action_key), dtype=self.reward_spec.dtype
-                ), )
+                ),
+            )
         return next_td
 
     def _maybe_make_done(
-            self, tensordict: TensorDictBase, next_td: TensorDictBase, resetting: bool = False, ) -> TensorDictBase:
+        self,
+        tensordict: TensorDictBase,
+        next_td: TensorDictBase,
+        resetting: bool = False,
+    ) -> TensorDictBase:
         if self.assign_done:
             action = tensordict.get(self.action_key)
             if action is None:
@@ -903,7 +961,9 @@ class LLMEnv(EnvBase):
                 "done", next_td.get(("tokens_data", "done")).any(-1, keepdim=True)
             )
             next_td.set(
-                "terminated", next_td.get(("tokens_data", "terminated")).any(-1, keepdim=True), )
+                "terminated",
+                next_td.get(("tokens_data", "terminated")).any(-1, keepdim=True),
+            )
         if not resetting and self.eos_token_id is not None:
             if self.from_text:
                 token_action_key = self._DEFAULT_ACTION_TOKENS_KEY
@@ -930,7 +990,7 @@ class LLMEnv(EnvBase):
         return next_td
 
     def _make_next_obs(
-            self, tensordict: TensorDictBase, nex_td: TensorDictBase
+        self, tensordict: TensorDictBase, nex_td: TensorDictBase
     ) -> TensorDictBase:
         # Cat action entry with prev obs
         if self.from_text:
@@ -947,8 +1007,10 @@ class LLMEnv(EnvBase):
                 )
             else:
                 observation = NonTensorStack(
-                    *[self._check_obs_act_and_cat(_obs, _action, device=self.device) for (_obs, _action) in
-                        _zip_strict(obs, action)]
+                    *[
+                        self._check_obs_act_and_cat(_obs, _action, device=self.device)
+                        for (_obs, _action) in _zip_strict(obs, action)
+                    ]
                 )
             return nex_td.set(self.str_key, observation)
         else:
@@ -957,9 +1019,14 @@ class LLMEnv(EnvBase):
                 action = tensordict.get(self.action_key)
                 if getattr(obs, "is_nested", False):
                     observation = torch.nested.as_nested_tensor(
-                        [torch.cat([_obs, _action], -1) for _obs, _action in _zip_strict(
-                            obs.unbind(0), action.unbind(0)
-                        )], layout=obs.layout, )
+                        [
+                            torch.cat([_obs, _action], -1)
+                            for _obs, _action in _zip_strict(
+                                obs.unbind(0), action.unbind(0)
+                            )
+                        ],
+                        layout=obs.layout,
+                    )
                 else:
                     observation = torch.cat([obs, action], -1)
                     if self.has_attention:
@@ -978,10 +1045,14 @@ class LLMEnv(EnvBase):
     def _reset(self, tensordict: TensorDictBase, **kwargs) -> TensorDictBase:
         # We should have an observation by this time, if not raise an exception
         def check_token():
-            return not self.from_text and (self.token_key not in tensordict.keys(isinstance(self.token_key, tuple)))
+            return not self.from_text and (
+                self.token_key not in tensordict.keys(isinstance(self.token_key, tuple))
+            )
 
         def check_str():
-            return self.from_text and (self.str_key not in tensordict.keys(isinstance(self.str_key, tuple)))
+            return self.from_text and (
+                self.str_key not in tensordict.keys(isinstance(self.str_key, tuple))
+            )
 
         if tensordict is None or check_token() or check_str():
             raise KeyError(
