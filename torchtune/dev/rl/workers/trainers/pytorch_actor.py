@@ -25,7 +25,7 @@ from torchdata.stateful_dataloader import StatefulDataLoader
 from torchdata.stateful_dataloader.sampler import StatefulDistributedSampler
 
 from torchrl.data import LazyStackStorage, RayReplayBuffer
-from torchrl.envs import LLMEnv
+from torchtune.dev.grpo.envs import LLMEnv
 from torchtune import config, generation, modules, rlhf, utils
 from torchtune.dev.grpo.rewards import batched_rewards
 from torchtune.dev.grpo.types import GRPOStats, GRPOTrajectory
