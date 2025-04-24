@@ -1,3 +1,9 @@
+# Copyright (c) Meta Platforms, Inc. and affiliates.
+# All rights reserved.
+#
+# This source code is licensed under the BSD-style license found in the
+# LICENSE file in the root directory of this source tree.
+
 import time
 from functools import partial
 from typing import Any, Callable, Dict, Optional
@@ -5,13 +11,10 @@ from typing import Any, Callable, Dict, Optional
 import ray
 import torch
 import torch.distributed
-import torchtune.training as training
-import vllm
 
 from omegaconf import DictConfig, ListConfig
 
 from ray.util.queue import Full as QueueFull
-
 from tensordict import lazy_stack, NonTensorStack, TensorDictBase
 from torchdata.stateful_dataloader import StatefulDataLoader
 from torchdata.stateful_dataloader.sampler import StatefulDistributedSampler
@@ -21,11 +24,10 @@ from torchrl.collectors import (
     WeightUpdateSenderBase,
 )
 
-from torchrl.envs import LLMEnv
-from torchtune import config, utils
+from torchtune import utils
 from torchtune.dev.rl.datatypes import Trajectory
 from torchtune.dev.rl.utils import stateless_init_process_group
-from vllm import LLM, SamplingParams
+from vllm import LLM
 from vllm.worker.worker import Worker
 
 log = utils.get_logger()
@@ -130,14 +132,6 @@ class SyncLLMCollector(SyncDataCollector):
 
         log.info("done init LLMCollector")
 
-    @property
-    def weight_update_sender(self) -> WeightUpdateSenderBase:
-        return self._weight_update_sender
-
-    @weight_update_sender.setter
-    def weight_update_sender(self, value: WeightUpdateSenderBase | None):
-        self._weight_update_sender = value
-
     def _postprocess_for_queue(self, data):
         # local import to avoid vLLM no CUDA GPUs available error
         from torchtune import training
@@ -194,15 +188,6 @@ class SyncLLMCollector(SyncDataCollector):
         total_generated_tokens = seq_lens.sum().item()
         return postprocessed_results, total_generated_tokens
 
-    def update_policy_weights_(
-        self,
-        policy_weights: TensorDictBase | None = None,
-        *,
-        worker_ids: int | list[int] | torch.device | list[torch.device] | None = None,
-        **kwargs,
-    ) -> None:
-        self.weight_update_receiver(policy_weights, **kwargs)
-
     def set_metric_logger(self, logger):
         """Store the MetricLoggerActor handle."""
         print(f"{self._is_collector_zero=} setting metric logger")
@@ -250,15 +235,14 @@ class SyncLLMCollector(SyncDataCollector):
 
         ray.get(self._metric_logger.log_dict.remote(log_dict, step=step_idx))
 
-    async def run(self):
-        num_steps = (self.cfg.num_steps // self.cfg.vllm.num_workers) + 1
-        for i in range(num_steps):
+    def run(self):
+        i = 0
+        while True:
             self.rollout(i)
             if i % self.cfg.vllm.steps_before_sync == 0:
                 log.info(f"{self.worker_id} about to update weights")
-                await self.weight_update_sender.update_weights.remote(
-                    weights=None, worker_ids=self.worker_id
-                )
+                self.update_policy_weights_()
+            i += 1
 
     def rollout(self, idx) -> TensorDictBase:
         if self.reset_at_each_iter or self._shuttle is None:

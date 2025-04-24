@@ -1,86 +1,31 @@
-#!/usr/bin/env python3
-
-"""
-README!! What's going on in this script?
-
-At a high level, this script is grpo_full_finetune_distributed.py but it
-1. Uses vLLM for generation instead of torchtune generate
-2. Uses ray for orchestrating data parallel actors and vllm actors + unsharded ref actor
-3. The dataloader is now owned by the vllm worker (rather than 1 dataloader per FSDP worker)
-4. Uses a ray.util.Queue (this wraps a remote actor with a queue) as a "replay buffer"
-   for the vllm workers to put their generated tokens into, and the FSDP workers to get them from
-5. Of the items in GRPOTrajectory
-        a. query_responses: vllm worker computes and puts into queue
-        b. logprobs vllm worker puts into queue
-        c. ref_logprobs: computed by unsharded RefActor which contains torchtune model
-        d. rewards: fsdp worker computes
-        e. sucecesses: fsdp worker computes
-        f. advantages: fsdp worker computes
-        g. masks: fsdp worker computes
-        h. position_ids: fsdp worker computes
-6. In config, we set ``steps_before_sync``. After ``steps_before_sync * num_data_parallel_worker`` steps
-   the vllm worker will "sleep" and spin in a while loop until the FSDP workers are done syncing their weights
-7. Weight sync currently blocks the train loop and is done by each fsdp workers .full_tensor (allgather) on each DTensor,
-   calling tune_to_hf and then rank 0 broadcasting (+ also calling the vllm collective rpc to make it also issues
-   the broadcast and then load weights call)
-
-With this script, I can observe successes + rewards increasing over training steps, which is
-a good sign. (See screenshot in Cabernet sprint notes.) But there are several issues with this script:
-1. Peak memory usage for the fsdp worker is significantly higher than the original recipe in a fresh conda environmnet.
-   This could be because
-    a. I turned compile off (it seems to be broken with torch 2.5.1 that vllm requires)
-    b. [FIXED] I turned activation checkpointing off (there wasn't an explcit reason for this it just got omitted accidentally)
-2. I have an assert that num_vllm_workers == 1 and vllm_tp_size == 1 for now. There's no real reason for this,
-   I expect the code to mostly generalize, just need to go over parts where I might have hardcoded this assumption of 1
-   vllm worker.
-3. Epochs is definitely not handled correctly right now :P
-4. There's many FIXMEs peppered through this script
-
-The run command is
-
-    python runnable_recipe_ray_vllm_weight_sync.py --config ../recipes/configs/dev/qwen3B_full_grpo.yaml
-
-
-"""
+# Copyright (c) Meta Platforms, Inc. and affiliates.
+# All rights reserved.
+#
+# This source code is licensed under the BSD-style license found in the
+# LICENSE file in the root directory of this source tree.
 
 import functools
 import os
 import time
-from functools import partial
-from typing import Any, Dict, List, Optional, Union
 
-from warnings import warn
+from typing import Any, Dict
 
 import ray
+
 import torch
 import torch.distributed
-import torch.nn as nn
-import torchtune.training as training
 
-from omegaconf import DictConfig, ListConfig, OmegaConf
-from ray.util.placement_group import placement_group
+from omegaconf import DictConfig, OmegaConf
 
-from ray.util.queue import Full as QueueFull, Queue
-from ray.util.scheduling_strategies import PlacementGroupSchedulingStrategy
+from ray.util.queue import Queue
 
-from readerwriterlock import rwlock
-from tensordict import TensorClass, TensorDict
+from tensordict import TensorDict, TensorDictBase
+from tensordict.utils import expand_as_right
 
-from torch.optim import Optimizer
-
-from torchdata.stateful_dataloader import StatefulDataLoader
-from torchdata.stateful_dataloader.sampler import StatefulDistributedSampler
-from torchrl.collectors import (
-    SyncDataCollector,
-    WeightUpdateReceiverBase,
-    WeightUpdateSenderBase,
-)
+from torchrl.collectors import WeightUpdateReceiverBase
 from torchrl.data import LazyStackStorage, RayReplayBuffer
-from torchtune import config, generation, modules, rlhf, utils
-from torchtune.dev.grpo.rewards import batched_rewards
-from torchtune.dev.grpo.types import GRPOStats, GRPOTrajectory
+from torchtune import config, utils
 from torchtune.dev.rl.datatypes import RequestOutput, Trajectory
-from torchtune.dev.rl.utils import stateless_init_process_group
 from torchtune.dev.rl.workers import (
     MetricLoggerActor,
     PyTorchActorModel,
@@ -88,25 +33,12 @@ from torchtune.dev.rl.workers import (
     SyncLLMCollector,
     VLLMParameterServer,
 )
-from torchtune.models.qwen2._convert_weights import qwen2_tune_to_hf
-
-from torchtune.training import DummyProfiler, PROFILER_KEY
+from torchtune.recipe_interfaces import OrchestrationRecipeInterface
+from vllm import SamplingParams
 
 from vllm.utils import get_ip, get_open_port
-from vllm.worker.worker import Worker
 
 log = utils.get_logger("DEBUG")
-
-
-# =============================================================================================
-
-from typing import Any, Dict
-
-import torch
-import vllm
-from tensordict import from_dataclass, lazy_stack, TensorClass, TensorDictBase
-from tensordict.utils import _zip_strict, expand_as_right
-from vllm import LLM, SamplingParams
 
 
 def vllm_generate(
@@ -199,11 +131,15 @@ def _get_output_tokens_and_log_probs(
 
 
 class VLLMHFWeightUpdateReceiver(WeightUpdateReceiverBase):
-    def __init__(self, master_address, master_port, model_metadata):
+    def __init__(
+        self, master_address, master_port, model_metadata, param_server, worker_idx
+    ):
         self.master_address = master_address
         self.master_port = master_port
         self.model_metadata = model_metadata
         self.initialized_group = None
+        self.param_server = param_server
+        self.worker_idx = worker_idx
 
     def _get_server_weights(self):
         return None
@@ -218,25 +154,35 @@ class VLLMHFWeightUpdateReceiver(WeightUpdateReceiverBase):
         return None
 
     def _update_local_weights(self, local_weights, mapped_weights):
-        inference_server = self.collector.inference_server
-        if self.initialized_group is None:
-            weight_sync_world_size = (
-                inference_server.llm_engine.parallel_config.tensor_parallel_size + 1
-            )
-            inference_server.collective_rpc(
-                "init_weight_update_group",
-                args=(self.master_address, self.master_port, 1, weight_sync_world_size),
-            )
-            self.initialized_group = True
+        should_update = not ray.get(
+            self.param_server._skip_update.remote(self.worker_idx)
+        )
+        if should_update:
+            self.param_server._sync_weights_with_worker.remote(self.worker_idx)
+            inference_server = self.collector.inference_server
+            if self.initialized_group is None:
+                weight_sync_world_size = (
+                    inference_server.llm_engine.parallel_config.tensor_parallel_size + 1
+                )
+                inference_server.collective_rpc(
+                    "init_weight_update_group",
+                    args=(
+                        self.master_address,
+                        self.master_port,
+                        1,
+                        weight_sync_world_size,
+                    ),
+                )
+                self.initialized_group = True
 
-        for k, (dtype, shape) in self.model_metadata.items():
-            inference_server.collective_rpc("update_weight", args=(k, dtype, shape))
+            for k, (dtype, shape) in self.model_metadata.items():
+                inference_server.collective_rpc("update_weight", args=(k, dtype, shape))
 
-        inference_server.collective_rpc("update_policy_version")
+            inference_server.collective_rpc("update_policy_version")
 
 
-class RayGRPORecipe:
-    def setup(self, cfg):
+class RayGRPORecipe(OrchestrationRecipeInterface):
+    def setup(self, cfg: DictConfig):
         self.cfg = cfg
 
         # Store worker counts as instance variables
@@ -381,9 +327,15 @@ class RayGRPORecipe:
 
         weight_update_receivers = [
             VLLMHFWeightUpdateReceiver(
-                vllm_master_address, vllm_update_port, self.model_metadata
+                vllm_master_address,
+                vllm_update_port,
+                self.model_metadata,
+                self.param_server,
+                idx,
             )
-            for vllm_master_address, vllm_update_port in zip(vllm_addresses, vllm_ports)
+            for idx, (vllm_master_address, vllm_update_port) in enumerate(
+                zip(vllm_addresses, vllm_ports)
+            )
         ]
 
         for i in range(self.num_vllm_workers):
@@ -400,17 +352,12 @@ class RayGRPORecipe:
                     policy=vllm_generate,
                     worker_id=i,
                     dialog_turns_per_batch=1,
-                    total_dialog_turns=1000,
+                    total_dialog_turns=-1,
                     reset_at_each_iter=True,
                     queue=self.rollout_queue,
                     weight_update_receiver=weight_update_receivers[i],
-                    weight_update_sender=self.param_server,
                 )
             )
-            # TODO: Currently we register a handle to the collector to the parameter server
-            # this will be cleaned up when we make the local_weight_updater remotely call
-            # the param server
-            ray.get(self.param_server.register_collector.remote(i, collector))
             data_collectors.append(collector)
         return data_collectors
 
@@ -426,15 +373,19 @@ class RayGRPORecipe:
             workers.append(worker)
         return workers
 
-    def train(self):
+    def run(self):
         rollout_handles = [worker.run.remote() for worker in self.rollout_workers]
         ref_handles = [worker.run.remote() for worker in self.ref_workers]
         worker_handles = [worker.train.remote() for worker in self.actor_workers]
-        ray.get(rollout_handles + ref_handles + worker_handles)
+        ray.get(worker_handles)
+        [ray.kill(w) for w in self.rollout_workers + self.ref_workers]
         ray.get(self.actor_workers[0].cleanup.remote())
 
     def stop_ray(self):
         ray.shutdown()
+
+    def cleanup(self):
+        self.stop_ray()
 
 
 @config.parse
@@ -447,8 +398,8 @@ def recipe_main(cfg: DictConfig) -> None:
 
     recipe = RayGRPORecipe()
     recipe.setup(cfg)
-    recipe.train()
-    recipe.stop_ray()
+    recipe.run()
+    recipe.cleanup()
 
 
 if __name__ == "__main__":
