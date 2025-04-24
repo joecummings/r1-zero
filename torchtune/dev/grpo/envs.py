@@ -796,7 +796,6 @@ class LLMEnv(EnvBase):
         Returns:
             LLMEnv: The created LLMEnv instance.
         """
-        from smith.envs import DataLoadingPrimer, Tokenizer
 
         if str_key is None:
             str_key = LLMEnv._DEFAULT_STR_KEY
