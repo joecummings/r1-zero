@@ -106,7 +106,7 @@ class SyncLLMCollector(SyncDataCollector):
         )
 
         # local import below LLM call to avoid vLLM no CUDA GPUs available error
-        from torchrl.envs import LLMEnv
+        from torchtune.dev.grpo.envs import LLMEnv
 
         env = LLMEnv.from_dataloader(
             dataloader=dataloader,

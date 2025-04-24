@@ -45,7 +45,7 @@ from torchrl.modules.llm.transformers_policy import from_hf_transformers
 from transformers import AutoTokenizer, GPT2Config, GPT2LMHeadModel
 
 from torchrl.collectors.distributed.ray import DEFAULT_RAY_INIT_CONFIG, RayCollector
-from torchrl.envs import LLMEnv
+from torchtune.dev.grpo.envs import LLMEnv
 
 
 async def main():
