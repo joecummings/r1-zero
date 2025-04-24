@@ -1,3 +1,9 @@
+# Copyright (c) Meta Platforms, Inc. and affiliates.
+# All rights reserved.
+#
+# This source code is licensed under the BSD-style license found in the
+# LICENSE file in the root directory of this source tree.
+
 from typing import Any, Dict
 
 import ray
@@ -192,9 +198,6 @@ class PostProcessingWorker:
         log.info("running ref actor")
         idx = 0
         while True:
-            if idx == self.cfg.orchestration.num_steps:
-                break
-
             # Start measuring total step time
             time_step_start = time.perf_counter()
             trajectory = None

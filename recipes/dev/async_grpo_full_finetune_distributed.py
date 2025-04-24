@@ -22,7 +22,6 @@ from ray.util.queue import Queue
 from tensordict import TensorDict, TensorDictBase
 from tensordict.utils import expand_as_right
 
-from torchrl.collectors import WeightUpdateReceiverBase
 from torchrl.data import LazyStackStorage, RayReplayBuffer
 from torchtune import config, utils
 from torchtune.dev.rl.datatypes import RequestOutput, Trajectory
@@ -31,6 +30,7 @@ from torchtune.dev.rl.workers import (
     PostProcessingWorker,
     SyncLLMCollector,
     TrainingWorker,
+    VLLMHFWeightUpdateReceiver,
     VLLMParameterServer,
 )
 from torchtune.recipe_interfaces import OrchestrationRecipeInterface
@@ -125,46 +125,6 @@ def _get_output_tokens_and_log_probs(
     tokens_response_td.rename_key_("logprobs", log_prob_key)
 
     return tokens_response_td
-
-
-# =============================================================================================
-
-
-class VLLMHFWeightUpdateReceiver(WeightUpdateReceiverBase):
-    def __init__(self, master_address, master_port, model_metadata):
-        self.master_address = master_address
-        self.master_port = master_port
-        self.model_metadata = model_metadata
-        self.initialized_group = None
-
-    def _get_server_weights(self):
-        return None
-
-    def _get_local_weights(self):
-        # We don't implement this because we let vLLM's update_weights API handle everything for now
-        return None
-
-    def _maybe_map_weights(self, server_weights, local_weights):
-        # vLLM update_weights function handles the mapping from huggingface
-        # so we don't implement this for now
-        return None
-
-    def _update_local_weights(self, local_weights, mapped_weights):
-        inference_server = self.collector.inference_server
-        if self.initialized_group is None:
-            weight_sync_world_size = (
-                inference_server.llm_engine.parallel_config.tensor_parallel_size + 1
-            )
-            inference_server.collective_rpc(
-                "init_weight_update_group",
-                args=(self.master_address, self.master_port, 1, weight_sync_world_size),
-            )
-            self.initialized_group = True
-
-        for k, (dtype, shape) in self.model_metadata.items():
-            inference_server.collective_rpc("update_weight", args=(k, dtype, shape))
-
-        inference_server.collective_rpc("update_policy_version")
 
 
 class RayGRPORecipe(OrchestrationRecipeInterface):
@@ -313,9 +273,15 @@ class RayGRPORecipe(OrchestrationRecipeInterface):
 
         weight_update_receivers = [
             VLLMHFWeightUpdateReceiver(
-                vllm_master_address, vllm_update_port, self.model_metadata
+                vllm_master_address,
+                vllm_update_port,
+                self.model_metadata,
+                self.param_server,
+                idx,
             )
-            for vllm_master_address, vllm_update_port in zip(vllm_addresses, vllm_ports)
+            for idx, (vllm_master_address, vllm_update_port) in enumerate(
+                zip(vllm_addresses, vllm_ports)
+            )
         ]
 
         for i in range(self.num_inference_workers):
@@ -332,17 +298,12 @@ class RayGRPORecipe(OrchestrationRecipeInterface):
                     policy=vllm_generate,
                     worker_id=i,
                     dialog_turns_per_batch=1,
-                    total_dialog_turns=1000,
+                    total_dialog_turns=-1,
                     reset_at_each_iter=True,
                     queue=self.rollout_queue,
                     weight_update_receiver=weight_update_receivers[i],
-                    weight_update_sender=self.param_server,
                 )
             )
-            # TODO: Currently we register a handle to the collector to the parameter server
-            # this will be cleaned up when we make the local_weight_updater remotely call
-            # the param server
-            ray.get(self.param_server.register_collector.remote(i, collector))
             data_collectors.append(collector)
         return data_collectors
 
@@ -362,7 +323,8 @@ class RayGRPORecipe(OrchestrationRecipeInterface):
         rollout_handles = [worker.run.remote() for worker in self.rollout_workers]
         ref_handles = [worker.run.remote() for worker in self.ref_workers]
         worker_handles = [worker.train.remote() for worker in self.actor_workers]
-        ray.get(rollout_handles + ref_handles + worker_handles)
+        ray.get(worker_handles)
+        [ray.kill(w) for w in self.rollout_workers + self.ref_workers]
         ray.get(self.actor_workers[0].cleanup.remote())
 
     def stop_ray(self):
