@@ -5,11 +5,13 @@
 # LICENSE file in the root directory of this source tree.
 
 import os
+import pdb
 import runpy
 import sys
 from pathlib import Path
 
 import pytest
+import ray
 import torch
 
 from omegaconf import OmegaConf
@@ -28,7 +30,7 @@ from tests.test_utils import (
     gpu_test,
     TOKENIZER_PATHS,
 )
-from torchtune.dev.rl.workers import PyTorchActorModel
+from torchtune.dev.rl.workers import MetricLoggerActor, PyTorchActorModel
 
 from torchtune.training.checkpointing._utils import (
     get_largest_iter_folder,
@@ -38,7 +40,16 @@ from torchtune.training.checkpointing._utils import (
 from vllm.utils import get_ip, get_open_port
 
 
+@pytest.fixture(params=[2, 1], autouse=True)
+def world_size(request):
+    size = request.param
+    ray.init(num_cpus=4 * size, num_gpus=size)
+    yield size
+    ray.shutdown()
+
+
 class TestAsyncGRPOTrainerWorker:
+
     def _get_test_config_overrides(self, epochs: int = 2):
         return [
             "dtype=fp32",
@@ -51,6 +62,12 @@ class TestAsyncGRPOTrainerWorker:
             "optimizer=torch.optim.AdamW",
             "optimizer.lr=2e-5",
             "log_every_n_steps=1",
+            "grpo_samples=1",
+            "temperature=0",
+            "top_k=1",
+            "max_generated_tokens=100",
+            "ppo_epochs=1",
+            "save_every_n_epochs=1",
         ]
 
     def _fetch_expected_loss_values_multi_rank(self, model_type):
@@ -83,6 +100,7 @@ class TestAsyncGRPOTrainerWorker:
         config,
         model_type,
         ckpt_type,
+        world_size,
         tmpdir,
     ):
         ckpt_component = CKPT_COMPONENT_MAP[ckpt_type]
@@ -111,15 +129,16 @@ class TestAsyncGRPOTrainerWorker:
             "fsdp_cpu_offload=True" \
         """.split()
         model_config = MODEL_TEST_CONFIGS[model_type]
-        overrides += +self._get_test_config_overrides() + model_config
+        overrides += self._get_test_config_overrides() + model_config
 
-        base_cfg = OmegaConf.resolve(config)
+        cfg_path = Path(__file__).parents[2] / "recipes/configs" / config
+        base_cfg = OmegaConf.load(str(cfg_path) + ".yaml")
         override_cfg = OmegaConf.from_dotlist(overrides)
         cfg = OmegaConf.merge(base_cfg, override_cfg)
 
-        # from vllm.utils import get_ip, get_open_port
-        world_size = 2
+        # Create Trainers
         trainers = []
+        replay_buffer = [torch.randn((micro_batch_size, 100, 16)) for _ in range(10)]
         for i in range(world_size):
             env_vars = {
                 "RANK": str(i),
@@ -127,210 +146,27 @@ class TestAsyncGRPOTrainerWorker:
                 "MASTER_ADDR": get_ip(),
                 "MASTER_PORT": get_open_port(),
             }
-            replay_buffer = [
-                torch.randn((micro_batch_size, 100, 16)) for _ in range(10)
-            ]
             trainer = PyTorchActorModel.remote(
                 cfg,
                 env_vars,
-                replay_buffer,
+                replay_buffer[i::world_size],
             )
             trainers.append(trainer)
-        # copy _create_fsdp_group -> launch workers with ray
+
+        # Add Metric Logging
+        logger = MetricLoggerActor.remote(cfg)
+        logger_handles = []
+        for worker in trainers:
+            logger_handles.append(worker.set_metric_logger.remote(logger))
+        ray.get(logger_handles)  # wait for all calls to complete
+
+        # Train
+        trainer_handles = [worker.train.remote() for worker in trainers]
+        ray.get(trainer_handles)
+        ray.get(trainers[0].cleanup.remote())
 
         loss_values = get_loss_values_from_metric_logger(log_file)
         expected_loss_values = self._fetch_expected_loss_values_multi_rank(model_type)
         torch.testing.assert_close(
             loss_values, expected_loss_values, rtol=1e-4, atol=1e-4
         )
-
-    # @pytest.mark.integration_test
-    # @pytest.mark.parametrize(
-    #     "config, model_type, ckpt_type, micro_batch_size, gradient_accumulation_steps, optim_in_bwd",
-    #     [
-    #         ("llama2/7B_full", "llama2", "hf", 1, 4, False),
-    #         ("llama3/8B_full", "llama3", "tune", 1, 4, False),
-    #         ("llama3/8B_full", "llama3", "tune", 4, 1, True),
-    #     ],
-    # )
-    # @gpu_test(gpu_count=1)
-    # def test_loss_single_rank(
-    #     self,
-    #     micro_batch_size,
-    #     gradient_accumulation_steps,
-    #     config,
-    #     model_type,
-    #     ckpt_type,
-    #     optim_in_bwd,
-    #     tmpdir,
-    #     monkeypatch,
-    # ):
-    #     ckpt_component = CKPT_COMPONENT_MAP[ckpt_type]
-    #     ckpt = model_type + "_" + ckpt_type
-    #     ckpt_path = Path(CKPT_MODEL_PATHS[ckpt])
-    #     tokenizer_path = Path(TOKENIZER_PATHS[model_type])
-    #     ckpt_dir = ckpt_path.parent
-    #     log_file = gen_log_file_name(tmpdir)
-
-    #     # Config file needed for model conversion.
-    #     write_hf_ckpt_config(ckpt_dir)
-
-    #     cmd = f"""
-    #     tune run --nnodes 1 --nproc_per_node 1 full_finetune_distributed \
-    #         --config {config} \
-    #         batch_size={micro_batch_size} \
-    #         gradient_accumulation_steps={gradient_accumulation_steps} \
-    #         output_dir={tmpdir} \
-    #         checkpointer._component_={ckpt_component} \
-    #         checkpointer.checkpoint_dir='{ckpt_dir}' \
-    #         checkpointer.checkpoint_files=[{ckpt_path}]\
-    #         checkpointer.output_dir={tmpdir} \
-    #         checkpointer.model_type={model_type.upper()} \
-    #         tokenizer.path='{tokenizer_path}' \
-    #         tokenizer.prompt_template=null \
-    #         metric_logger.filename={log_file} \
-    #     """.split()
-    #     model_config = MODEL_TEST_CONFIGS[model_type]
-    #     cmd = cmd + self._get_test_config_overrides() + model_config
-    #     # "optimizer_in_bwd=True" would free gradient info before clip_grad, causing
-    #     # wrong grad_norm, so we only test one of them each time. But loss values
-    #     # should be the same.
-    #     if not optim_in_bwd:
-    #         cmd.append("clip_grad_norm=100")
-    #     else:
-    #         cmd.append("optimizer_in_bwd=True")
-
-    #     monkeypatch.setattr(sys, "argv", cmd)
-    #     runpy.run_path(TUNE_PATH, run_name="__main__")
-    #     loss_values = get_loss_values_from_metric_logger(log_file)
-    #     expected_loss_values = self._fetch_expected_loss_values_single_rank(model_type)
-    #     torch.testing.assert_close(
-    #         loss_values, expected_loss_values, rtol=1e-4, atol=1e-4
-    #     )
-
-    # @pytest.mark.integration_test
-    # @pytest.mark.parametrize(
-    #     "config, model_type, ckpt_type, micro_batch_size, gradient_accumulation_steps, optim_in_bwd",
-    #     [
-    #         ("llama3/8B_full", "llama3", "tune", 1, 4, False),
-    #         ("llama3/8B_full", "llama3", "tune", 4, 1, True),
-    #     ],
-    # )
-    # @gpu_test(gpu_count=2)
-    # def test_training_state_on_resume(
-    #     self,
-    #     micro_batch_size,
-    #     gradient_accumulation_steps,
-    #     config,
-    #     model_type,
-    #     ckpt_type,
-    #     optim_in_bwd,
-    #     tmpdir,
-    #     monkeypatch,
-    # ):
-    #     ckpt_component = CKPT_COMPONENT_MAP[ckpt_type]
-    #     ckpt = model_type + "_" + ckpt_type
-    #     ckpt_path = Path(CKPT_MODEL_PATHS[ckpt])
-    #     tokenizer_path = Path(TOKENIZER_PATHS[model_type])
-    #     ckpt_dir = ckpt_path.parent
-    #     log_file = gen_log_file_name(tmpdir)
-    #     # Config file needed for model conversion.
-    #     # Create a second copy for training resume
-    #     write_hf_ckpt_config(ckpt_dir)
-    #     write_hf_ckpt_config(tmpdir)
-
-    #     # Train for two epochs
-    #     cmd_1 = f"""
-    #     tune run --nnodes 1 --nproc_per_node 2 full_finetune_distributed \
-    #         --config {config} \
-    #         batch_size={micro_batch_size} \
-    #         gradient_accumulation_steps={gradient_accumulation_steps} \
-    #         output_dir={tmpdir} \
-    #         checkpointer._component_={ckpt_component} \
-    #         checkpointer.checkpoint_dir='{ckpt_dir}' \
-    #         checkpointer.checkpoint_files=[{ckpt_path}]\
-    #         checkpointer.output_dir={tmpdir} \
-    #         checkpointer.model_type={model_type.upper()} \
-    #         tokenizer.path='{tokenizer_path}' \
-    #         tokenizer.prompt_template=null \
-    #     """.split()
-
-    #     # "optimizer_in_bwd=True" would free gradient info before clip_grad, causing
-    #     # wrong grad_norm, so we only test one of them each time. But loss values
-    #     # should be the same.
-    #     if not optim_in_bwd:
-    #         cmd_1.append("clip_grad_norm=100")
-    #         cmd_1.append("optimizer_in_bwd=False")
-    #     else:
-    #         cmd_1.append("optimizer_in_bwd=True")
-
-    #     model_config = MODEL_TEST_CONFIGS[model_type]
-    #     cmd_1 = cmd_1 + self._get_test_config_overrides() + model_config
-
-    #     monkeypatch.setattr(sys, "argv", cmd_1)
-    #     runpy.run_path(TUNE_PATH, run_name="__main__")
-
-    #     # Resume training
-    #     epoch_folder = get_largest_iter_folder(tmpdir)
-    #     epoch_folder_minus_one = f"epoch_{int(epoch_folder.split('_')[-1]) - 1}"
-    #     suffix = ".safetensors" if ckpt_type == "hf" else ".bin"
-    #     model_ckpt_fname = (
-    #         SHARD_FNAME.format(cpt_idx="1".zfill(5), num_shards="1".zfill(5)) + suffix
-    #     )
-    #     cmd_2 = f"""
-    #     tune run --nnodes 1 --nproc_per_node 2 full_finetune_distributed \
-    #         --config {config} \
-    #         batch_size={micro_batch_size} \
-    #         gradient_accumulation_steps={gradient_accumulation_steps} \
-    #         output_dir={tmpdir} \
-    #         checkpointer._component_={ckpt_component} \
-    #         checkpointer.checkpoint_dir='{ckpt_dir}' \
-    #         checkpointer.checkpoint_files=[{os.path.join(epoch_folder_minus_one, model_ckpt_fname)}]\
-    #         checkpointer.recipe_checkpoint={os.path.join(RECIPE_STATE_DIRNAME, "recipe_state.pt")}\
-    #         checkpointer.output_dir={tmpdir} \
-    #         checkpointer.model_type={model_type.upper()} \
-    #         tokenizer.path='{tokenizer_path}' \
-    #         tokenizer.prompt_template=null \
-    #         resume_from_checkpoint=True \
-    #         metric_logger.filename={log_file}
-    #     """.split()
-
-    #     cmd_2 = cmd_2 + self._get_test_config_overrides() + model_config
-
-    #     if not optim_in_bwd:
-    #         cmd_2.append("clip_grad_norm=100")
-    #         cmd_2.append("optimizer_in_bwd=False")
-    #     else:
-    #         cmd_2.append("optimizer_in_bwd=True")
-
-    #     monkeypatch.setattr(sys, "argv", cmd_2)
-    #     runpy.run_path(TUNE_PATH, run_name="__main__")
-
-    #     expected_loss_values = self._fetch_expected_loss_values_multi_rank(model_type)[
-    #         2:
-    #     ]
-
-    #     loss_values = get_loss_values_from_metric_logger(log_file)
-    #     torch.testing.assert_close(
-    #         loss_values, expected_loss_values, rtol=1e-4, atol=1e-4
-    #     )
-
-    # @pytest.mark.integration_test
-    # @pytest.mark.parametrize(
-    #     "config, model_type, ckpt_type, micro_batch_size, gradient_accumulation_steps, optim_in_bwd",
-    #     [
-    #         ("llama2/7B_full", "llama2", "hf", 1, 4, False),
-    #         ("llama3/8B_full", "llama3", "tune", 1, 4, False),
-    #         ("llama3/8B_full", "llama3", "tune", 4, 1, True),
-    #     ],
-    # )
-
-    # @pytest.mark.integration_test
-    # @pytest.mark.parametrize(
-    #     "config, model_type, ckpt_type, micro_batch_size, gradient_accumulation_steps, optim_in_bwd",
-    #     [
-    #         ("llama2/7B_full", "llama2", "hf", 1, 4, False),
-    #         ("llama3/8B_full", "llama3", "tune", 1, 4, False),
-    #         ("llama3/8B_full", "llama3", "tune", 4, 1, True),
-    #     ],
-    # )
