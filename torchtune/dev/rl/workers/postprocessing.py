@@ -13,7 +13,7 @@ log = utils.get_logger("DEBUG")
 
 
 @ray.remote(num_cpus=8, num_gpus=1)
-class RefActor:
+class PostProcessingWorker:
     def __init__(self, *args, **kwargs):
         assert "rollout_queue" in kwargs, "Must pass queue to vLLMRefActor"
         assert "replay_buffer" in kwargs, "Must pass replay_buffer to vLLMRefActor"
@@ -25,24 +25,28 @@ class RefActor:
         self.cfg = kwargs.pop("cfg")
         self.rollout_queue = kwargs.pop("rollout_queue")
         self.replay_buffer = kwargs.pop("replay_buffer")
-        self._device = utils.get_device(device=self.cfg.device)
+        self._device = utils.get_device(device=self.cfg.postprocessing.device_type)
         self._tokenizer = config.instantiate(self.cfg.tokenizer)
-        self._dtype = training.get_dtype(self.cfg.dtype, device=self._device)
+        self._dtype = training.get_dtype(
+            self.cfg.postprocessing.dtype, device=self._device
+        )
         ref_checkpoint_dict = self.load_ref_checkpoint(
             cfg_ref_checkpointer=self.cfg.ref_checkpointer
         )
         self._ref_model = self._setup_model(
             self.cfg.model, ref_checkpoint_dict[training.MODEL_KEY]
         )
-        self._temperature = self.cfg.temperature
+        self._temperature = self.cfg.inference.temperature
 
         self.metric_logger = None  # Placeholder for the logger
 
-        self.grpo_samples = self.cfg.grpo_samples
-        self.vllm_batch_size = self.cfg.vllm.batch_size
+        self.group_size = self.cfg.inference.group_size
+        self.vllm_batch_size = self.cfg.inference.batch_size
 
-        device_type = self.cfg.device
-        self._log_peak_memory_stats = self.cfg.get("log_peak_memory_stats", True)
+        device_type = self.cfg.postprocessing.device_type
+        self._log_peak_memory_stats = self.cfg.metric_logger.get(
+            "log_peak_memory_stats", True
+        )
         if self._log_peak_memory_stats and device_type != "cuda":
             log.info(
                 "log_peak_memory_stats was set to True, however, training does not use cuda. Setting log_peak_memory_stats=False."
@@ -58,7 +62,7 @@ class RefActor:
         )
 
     def set_metric_logger(self, logger):
-        """Store the MetricLoggerActor handle."""
+        """Store the MetricLoggerWorker handle."""
         if self._is_actor_zero:
             print(f"setting metric logger {logger} for actor id", self.actor_id)
             self._metric_logger = logger
@@ -188,7 +192,7 @@ class RefActor:
         log.info("running ref actor")
         idx = 0
         while True:
-            if idx == self.cfg.num_steps:
+            if idx == self.cfg.orchestration.num_steps:
                 break
 
             # Start measuring total step time
@@ -234,8 +238,8 @@ class RefActor:
                 ref_logits, trajectory.responses, self._temperature
             )
 
-            batch_size = self.cfg.vllm.batch_size  # B
-            group_size = self.grpo_samples  # G
+            batch_size = self.cfg.inference.batch_size  # B
+            group_size = self.group_size  # G
 
             del ref_logits, position_ids, masks
             # masking of ref_logprobs is done in grpo_step
@@ -248,8 +252,8 @@ class RefActor:
             seq_lens = trajectory.seq_lens
             answers = trajectory.answers  # list[str] of len (B * G)
             answers = [
-                answers[i : i + self.grpo_samples]
-                for i in range(0, len(answers), self.grpo_samples)
+                answers[i : i + self.group_size]
+                for i in range(0, len(answers), self.group_size)
             ]  # list[list[str]] of len [B, G]. Basically a reshape
 
             # Compute padded tokens percentage
