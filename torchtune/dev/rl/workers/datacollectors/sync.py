@@ -185,6 +185,8 @@ class SyncLLMCollector(SyncDataCollector):
         """Store the MetricLoggerActor handle."""
         if self._is_collector_zero:
             self._metric_logger = logger
+        else:
+            self._metric_logger = None
 
     def _log_metrics(
         self,
@@ -300,14 +302,14 @@ class SyncLLMCollector(SyncDataCollector):
                 ),
             }
             time_total_rollout = time.perf_counter() - time_step_start
-            self._log_metrics(
-                step_idx=idx,
-                time_total_rollout=time_total_rollout,
-                time_generate=time_generate,
-                total_generated_tokens=total_generated_tokens,
-                # full_queue_data_discard=full_queue_data_discard,
-                gpu_memory=gpu_memory,
-            )
+            # self._log_metrics(
+            #     step_idx=idx,
+            #     time_total_rollout=time_total_rollout,
+            #     time_generate=time_generate,
+            #     total_generated_tokens=total_generated_tokens,
+            #     # full_queue_data_discard=full_queue_data_discard,
+            #     gpu_memory=gpu_memory,
+            # )
 
         return data
 
