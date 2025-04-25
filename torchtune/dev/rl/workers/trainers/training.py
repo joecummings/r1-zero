@@ -110,7 +110,6 @@ class TrainingWorker:
         self.device_mesh = torch.distributed.device_mesh.DeviceMesh.from_group(
             self.fsdp_group, device_type="cuda"
         )
-        print(self.device_mesh)
 
         self._is_rank_zero = self.rank == 0
 
@@ -719,9 +718,9 @@ class TrainingWorker:
                 )
             else:
                 beyond_seq_len = 0
-            per_sample_dict[
-                "beyond_seq_len_masking_is_positive (should be 0)"
-            ] = beyond_seq_len
+            per_sample_dict["beyond_seq_len_masking_is_positive (should be 0)"] = (
+                beyond_seq_len
+            )
 
             per_sample_dict["num_tokens_response"] = seq_len
             per_sample_dict["step"] = self._steps_run

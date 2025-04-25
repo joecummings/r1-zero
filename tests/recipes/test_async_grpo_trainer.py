@@ -32,7 +32,7 @@ from tests.test_utils import (
 )
 
 from torchrl.collectors.collectors import WeightUpdateSenderBase
-from torchtune.dev.rl.workers import MetricLoggerActor, PyTorchActorModel
+from torchtune.dev.rl.workers import MetricLoggerWorker, TrainingWorker
 from vllm.utils import get_ip, get_open_port
 
 
@@ -89,23 +89,23 @@ def world_size(request):
 class TestAsyncGRPOTrainerWorker:
     def _get_test_config_overrides(self, epochs: int = 2):
         return [
-            "dtype=fp32",
-            "enable_activation_checkpointing=False",
-            "enable_activation_offloading=False",
             "dataset.train_on_input=False",
+            "orchestration.num_steps=4",
             "seed=9",
-            f"epochs={epochs}",
-            "max_steps_per_epoch=2",
-            "optimizer=torch.optim.AdamW",
-            "optimizer.lr=2e-5",
-            "num_steps=1",
             "log_every_n_steps=1",
-            "grpo_samples=1",
-            "temperature=0",
-            "top_k=1",
-            "max_generated_tokens=100",
-            "ppo_epochs=1",
-            "save_every_n_epochs=1",
+            "training.enable_activation_checkpointing=False",
+            "training.enable_activation_offloading=False",
+            "training.dtype=fp32",
+            "training.optimizer=torch.optim.AdamW",
+            "training.optimizer.lr=2e-5",
+            "training.steps_before_sync=2",
+            "training.device_type=cuda",
+            f"training.epochs={epochs}",
+            "training.ppo_epochs=1",
+            "training.clip_grad_norm=1.0",
+            "training.ppo_epochs=1",
+            "training.resume_from_checkpoint=False",
+            "training.save_every_n_epochs=1",
         ]
 
     def _fetch_expected_loss_values_multi_rank(self, model_type):
@@ -153,7 +153,7 @@ class TestAsyncGRPOTrainerWorker:
         write_hf_ckpt_config(ckpt_dir)
 
         overrides = f"""
-            batch_size={micro_batch_size} \
+            training.batch_size={micro_batch_size} \
             gradient_accumulation_steps={gradient_accumulation_steps} \
             output_dir={tmpdir} \
             checkpointer._component_={ckpt_component} \
@@ -164,7 +164,6 @@ class TestAsyncGRPOTrainerWorker:
             tokenizer.path='{tokenizer_path}' \
             tokenizer.prompt_template=null \
             metric_logger.filename={log_file} \
-            "clip_grad_norm=100" \
             "fsdp_cpu_offload={cpu_offload}" \
         """.split()
         model_config = MODEL_TEST_CONFIGS[model_type]
@@ -187,7 +186,7 @@ class TestAsyncGRPOTrainerWorker:
                 "MASTER_ADDR": ip,
                 "MASTER_PORT": port,
             }
-            trainer = PyTorchActorModel.remote(
+            trainer = TrainingWorker.remote(
                 cfg,
                 env_vars,
                 replay_buffer[i::num_trainers],
@@ -200,7 +199,7 @@ class TestAsyncGRPOTrainerWorker:
         trainers[0].register_parameter_server.remote(param_server)
 
         # Add Metric Logging
-        logger = MetricLoggerActor.remote(cfg)
+        logger = MetricLoggerWorker.remote(cfg)
         logger_handles = []
         for worker in trainers:
             logger_handles.append(worker.set_metric_logger.remote(logger))
