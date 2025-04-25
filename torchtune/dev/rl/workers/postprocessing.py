@@ -12,8 +12,8 @@ import torchtune.training as training
 from omegaconf import DictConfig
 
 from torchtune import config, generation, rlhf, utils
-from torchtune.dev.grpo.rewards import batched_rewards
 from torchtune.dev.rl.datatypes import Trajectory
+from torchtune.dev.rl.rewards import batched_rewards
 
 log = utils.get_logger("DEBUG")
 

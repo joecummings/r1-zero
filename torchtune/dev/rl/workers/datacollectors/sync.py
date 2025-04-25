@@ -95,7 +95,7 @@ class SyncLLMCollector(SyncDataCollector):
         self.policy_kwargs = policy_kwargs
 
         collate_name = self.cfg.get(
-            "collate_fn", "torchtune.dev.grpo.data.padded_collate_rl"
+            "collate_fn", "torchtune.dev.rl.data.padded_collate_rl"
         )
         dataloader = self._setup_data(
             self.cfg.dataset,

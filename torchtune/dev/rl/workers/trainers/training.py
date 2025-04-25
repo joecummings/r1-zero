@@ -27,9 +27,9 @@ from torchdata.stateful_dataloader.sampler import StatefulDistributedSampler
 from torchrl.data import LazyStackStorage, RayReplayBuffer
 from torchrl.envs import LLMEnv
 from torchtune import config, generation, modules, rlhf, utils
-from torchtune.dev.grpo.rewards import batched_rewards
-from torchtune.dev.grpo.types import GRPOStats, GRPOTrajectory
 from torchtune.dev.rl.datatypes import Trajectory
+from torchtune.dev.rl.rewards import batched_rewards
+from torchtune.dev.rl.types import GRPOStats, GRPOTrajectory
 from torchtune.dev.rl.utils import stateless_init_process_group
 from torchtune.models.qwen2._convert_weights import qwen2_tune_to_hf
 

@@ -20,9 +20,9 @@ from torchdata.stateful_dataloader.sampler import StatefulDistributedSampler
 from torchtune import config, generation, modules, rlhf, training, utils
 from torchtune.config._utils import _get_component_from_path
 from torchtune.datasets import ConcatDataset
-from torchtune.dev.grpo.generation import generate
-from torchtune.dev.grpo.rewards import batched_rewards
-from torchtune.dev.grpo.types import GRPOStats, GRPOTrajectory
+from torchtune.dev.rl.generation import generate
+from torchtune.dev.rl.rewards import batched_rewards
+from torchtune.dev.rl.types import GRPOStats, GRPOTrajectory
 from torchtune.modules import local_kv_cache
 from torchtune.recipe_interfaces import FTRecipeInterface
 from torchtune.training import disable_dropout, DummyProfiler, PROFILER_KEY
