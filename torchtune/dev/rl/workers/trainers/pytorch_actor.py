@@ -389,7 +389,7 @@ class PyTorchActorModel:
         # TODO: remove this
         print('Messing up params!')
         for p in self._model.parameters():
-            p.data.copy_(p.data + torch.randn_like(p.data) * 0.1)
+            p.data.copy_(p.data + torch.randn_like(p.data) * 0.01)
         optimizer = config.instantiate(cfg_optimizer, self._model.parameters())
 
         # TODO: does this work?
