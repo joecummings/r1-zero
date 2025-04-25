@@ -14,5 +14,5 @@ class Trajectory(TensorClass["nocast"]):
     answers: torch.Tensor
     policy_version: int
     advantages: torch.Tensor
-    rewards_outputs: List[RewardOutput]
+    reward_outputs: List[RewardOutput]
     sequence_ids: List[str]

@@ -618,7 +618,7 @@ class TrainingWorker:
         num_samples = min(
             self.debug_num_samples_per_step, grpo_trajectory.query_responses.size(0)
         )
-
+        print(f"query responses size: {grpo_trajectory.query_responses.size(0)}")
         # Extract response tokens
         targets = grpo_trajectory.query_responses[:, context_length:]
         per_sample_table_data = []
@@ -654,8 +654,8 @@ class TrainingWorker:
             per_sample_dict["answers"] = grpo_trajectory.answers[idx]
             per_sample_dict["policy_version"] = metadata["policy_version"][idx]
 
-            for reward_output in metadata["reward_outputs"]:
-                per_sample_dict.update(reward_output.log(prefix="rewards", idx=idx))
+            for reward_output in metadata["reward_outputs"][idx]:
+                per_sample_dict.update(reward_output.log(prefix="rewards"))
 
             # Add GRPO statistics, handling per-sample vs. scalar cases
             # TODO: currently has one scalar per batch. We should enable a scalar per sentence.
