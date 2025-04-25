@@ -8,6 +8,8 @@ import re
 from typing import List, Tuple
 from xml.etree import ElementTree as ET
 
+import math_verify
+
 import torch
 
 # from tensordict import TensorDict, TensorDictBase
@@ -16,7 +18,6 @@ import torch
 
 from torchtune.modules.transforms.tokenizers import ModelTokenizer
 
-import math_verify
 
 def extract_tags(text: str) -> Tuple[str, str]:
     """
@@ -52,8 +53,12 @@ def math_response_correct(
     attempt = math_verify.parse(potential_answer)
 
     if math_verify.verify(gold, attempt):
+        print("Gold")
+        raise RuntimeError("Gold")
         return 100.0, 1.0
     if answer in potential_answer:
+        print("Silver")
+        raise RuntimeError("Silver")
         return 50.0, 0.0
     if len(potential_answer) > 0:
         return 1.0, 0.0
