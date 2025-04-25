@@ -36,15 +36,10 @@ class RewardOutput:
 
         Args:
             prefix: an optional prefix to add to the log keys
+            idx: an optional index to log the reward for
 
         Returns:
-            A dictionary of the logged statistics. Each of ``self.total_reward``,
-                ``self.successes``, and the keys of ``self.rewards`` are averaged before logging,
-                and keys are logged as:
-                    - ``{prefix}/{self.reward_base_name}`` for ``self.total_reward``,
-                    - ``{prefix}/{self.reward_base_name}/successes`` for ``self.successes``, and
-                    - ``{prefix}/{self.reward_base_name}/{key}`` for each key in ``self.rewards``.
-
+            A dictionary of the logged statistics.
         Example:
             >>> reward_output = RewardOutput(
                 reward_base_name="math_correctness",
@@ -58,6 +53,13 @@ class RewardOutput:
                 "train/math_correctness/successes": 0.6666666666666666,
                 "train/math_correctness/soft_format_reward": 1.0,
                 "train/math_correctness/strict_format_reward": 1.0
+            }
+            >>> reward_output.log(prefix="train", idx=1)
+            {
+                "train/math_correctness": 2.0,
+                "train/math_correctness/successes": 0.0,
+                "train/math_correctness/soft_format_reward": 0.0,
+                "train/math_correctness/strict_format_reward": 0.0
             }
         """
         log_dict = {}
