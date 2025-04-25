@@ -116,6 +116,17 @@ orchestration:
   replay_buffer_size: ${inference.batch_size}  # TODO this needs to be fixed. Right now this can't be bigger, or else we'll get padding issues
   num_steps: 250
 
+reward_functions:
+    - _component_: torchtune.dev.grpo.rewards.FormattedMathCorrectnessReward
+      answer_tag: answer
+      positive_reward: 10.0
+      negative_reward: 0.0
+    - _component_: torchtune.dev.grpo.rewards.ThinkingAnswerFormattingReward
+      think_tag: think
+      answer_tag: answer
+      positive_reward: 1.0
+      negative_reward: 0.0
+
 # Logging
 metric_logger:
   _component_: torchtune.training.metric_logging.WandBLogger
