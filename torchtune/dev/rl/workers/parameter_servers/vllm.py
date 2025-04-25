@@ -44,6 +44,9 @@ class vLLMParameterServer(RemoteWeightUpdaterBase):
         # FIXME: why this hang even when I pass use_local_synchronization=False in the other one??
         # self.fsdp_group = torch.distributed.new_group(ranks=list(range(self.world_size - 1)))
 
+    def _get_local_weights(self, *args, **kwargs):
+        ...
+
     def register_collector(self, worker_id, handle):
         self.vllm_worker_handles[worker_id] = handle
         log.info(f"registered collector {worker_id=}")
