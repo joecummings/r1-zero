@@ -1,3 +1,11 @@
+# Copyright (c) Meta Platforms, Inc. and affiliates.
+# All rights reserved.
+#
+# This source code is licensed under the BSD-style license found in the
+# LICENSE file in the root directory of this source tree.
+
+import os
+
 import ray
 import torch
 from readerwriterlock import rwlock
@@ -10,7 +18,6 @@ log = utils.get_logger("DEBUG")
 @ray.remote(num_cpus=4, num_gpus=1)
 class VLLMParameterServer:
     def __init__(self, cfg, vllm_master_addresses, vllm_master_ports, env_vars):
-        log.info("in param server init")
         super().__init__()
         self.cfg = cfg
         self.vllm_master_addresses = vllm_master_addresses
@@ -18,11 +25,6 @@ class VLLMParameterServer:
         self.vllm_comm_groups = dict()
         self.vllm_weight_versions = dict()
         self.vllm_worker_handles = dict()
-
-        import os
-
-        import torch
-        import torch.distributed
 
         torch.cuda.set_device(torch.device("cuda", 0))
 
@@ -57,9 +59,6 @@ class VLLMParameterServer:
         torch.cuda.synchronize()
         self.write_lock.release()
 
-    def all_worker_ids(self):
-        return [i for i in range(len(self.collector._remote_collectors))]
-
     def _get_server_weights(self):
         return self.state_dict
 
@@ -73,13 +72,13 @@ class VLLMParameterServer:
             return False
         if self.vllm_weight_versions[worker_id] == self.version:
             log.info(
-                f"skipping update for {worker_id=}, {self.version=}, {self.vllm_weight_versions[worker_id]=}"
+                f"Skipping update for {worker_id=}, {self.version=}, {self.vllm_weight_versions[worker_id]=}"
             )
             return True
         return False
 
     def _init_model_update_group(self, worker_id):
-        vllm_tp_size = self.cfg.inference.tp_size
+        vllm_tp_size = self.cfg.inference.tensor_parallel_dim
         weight_sync_world_size = vllm_tp_size + 1
         model_update_group = stateless_init_process_group(
             self.vllm_master_addresses[worker_id],
@@ -92,7 +91,6 @@ class VLLMParameterServer:
 
     def _sync_weights_with_worker(self, worker_id: int):
         server_weights = self._maybe_map_weights(self._get_server_weights())
-        print(f"in _sync_weights_with_worker {worker_id}")
         if worker_id not in self.vllm_comm_groups:
             self._init_model_update_group(worker_id)
         read_lock = self.state_dict_lock.gen_rlock()
@@ -105,10 +103,9 @@ class VLLMParameterServer:
             self.version_tensor, src=0, stream=torch.cuda.current_stream()
         )
         torch.cuda.synchronize()
-        print(f"_sync_weights_with_worker done broadcast {worker_id} {self.version=}")
         self.vllm_weight_versions[worker_id] = self.version
         read_lock.release()
 
     def receive_from_trainer(self):
-        for k, v in self.state_dict.items():
+        for _, v in self.state_dict.items():
             torch.distributed.recv(v, src=0)

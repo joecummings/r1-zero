@@ -385,7 +385,7 @@ class FullModelHFCheckpointer(_CheckpointerInterface):
             containing the keys keys ["filename_format", "max_filename"]. Since the checkpointer takes care
             of sorting by file ID, the order in this list does not matter.
         model_type (str): Model type of the model for which the checkpointer is being loaded, e.g. LLAMA3.
-        output_dir (str): Directory to save the checkpoint files
+        output_dir (Optional[str]): Directory to save the checkpoint files, default None.
         adapter_checkpoint (Optional[str]): Path to the adapter weights. If None,
             and `should_load_recipe_state=True`, then look for adapter_model.pt in output_dir/epoch_{largest_epoch}.
             Default is None.
@@ -406,7 +406,7 @@ class FullModelHFCheckpointer(_CheckpointerInterface):
         checkpoint_dir: str,
         checkpoint_files: Union[List[str], Dict[str, str]],
         model_type: str,
-        output_dir: str,
+        output_dir: Optional[str] = None,
         adapter_checkpoint: Optional[str] = None,
         recipe_checkpoint: Optional[str] = None,
         resume_from_checkpoint: bool = False,
@@ -424,11 +424,14 @@ class FullModelHFCheckpointer(_CheckpointerInterface):
         self._safe_serialization = safe_serialization
         self._checkpoint_dir = Path(checkpoint_dir)
         self._model_type = ModelType[model_type]
-        self._output_dir = Path(output_dir)
-        check_outdir_not_in_ckptdir(
-            ckpt_dir=self._checkpoint_dir, out_dir=self._output_dir
-        )
-        self._output_dir.mkdir(parents=True, exist_ok=True)
+        if output_dir is not None:
+            self._output_dir = Path(output_dir)
+            check_outdir_not_in_ckptdir(
+                ckpt_dir=self._checkpoint_dir, out_dir=self._output_dir
+            )
+            self._output_dir.mkdir(parents=True, exist_ok=True)
+        else:
+            self._output_dir = self._checkpoint_dir
 
         # weight_map contains the state_dict key -> checkpoint file mapping so we can correctly
         # parition the state dict into output checkpoint files. This is updated during checkpoint
@@ -640,6 +643,8 @@ class FullModelHFCheckpointer(_CheckpointerInterface):
         epoch: int,
         intermediate_checkpoint: bool = False,
         adapter_only: bool = False,
+        *,
+        step: Optional[int] = None,
     ) -> None:
         """
         Save HF checkpoint to file. If ``intermediate_checkpoint`` is True, an additional
@@ -655,10 +660,12 @@ class FullModelHFCheckpointer(_CheckpointerInterface):
             intermediate_checkpoint (bool): If True, an additional checkpoint files for recipe state
                 and (if applicable) adapter weights are created. Default is False
             adapter_only (bool): If True, only save the adapter weights. Default is False
+            step (Optional[int]): Step number. Used to create the checkpoint file name.
 
         Raises:
             ValueError: if ``adapter_only`` is True and adapter checkpoint not found in state_dict.
         """
+        output_dirname = f"step_{step}" if step is not None else f"epoch_{epoch}"
         # convert the state_dict back to hf format; do this inplace
         if not adapter_only:
             if self._model_type == ModelType.PHI3_MINI:
@@ -758,7 +765,7 @@ class FullModelHFCheckpointer(_CheckpointerInterface):
                 )
                 map_original_name_to_new_name[cpt_idx] = shard_name
                 output_path = Path.joinpath(
-                    self._output_dir, f"epoch_{epoch}", shard_name
+                    self._output_dir, output_dirname, shard_name
                 )
                 output_path.parent.mkdir(parents=True, exist_ok=True)
                 if not self._safe_serialization:
@@ -790,7 +797,7 @@ class FullModelHFCheckpointer(_CheckpointerInterface):
                 index_file_name = TORCH_INDEX_FNAME
 
             index_path = Path.joinpath(
-                self._output_dir, f"epoch_{epoch}", index_file_name
+                self._output_dir, output_dirname, index_file_name
             )
 
             index_data = {
@@ -807,7 +814,7 @@ class FullModelHFCheckpointer(_CheckpointerInterface):
             # convert_weights.peft_to_tune. The .pt format is not needed, but
             # it is an easy way to distinguish the adapters. Ideally we should save only one.
             output_path = Path.joinpath(
-                self._output_dir, f"epoch_{epoch}", ADAPTER_MODEL_FNAME
+                self._output_dir, output_dirname, ADAPTER_MODEL_FNAME
             ).with_suffix(".pt")
             output_path.parent.mkdir(parents=True, exist_ok=True)
             torch.save(state_dict[training.ADAPTER_KEY], output_path)
@@ -836,7 +843,7 @@ class FullModelHFCheckpointer(_CheckpointerInterface):
                     head_dim=self._config.get("head_dim", None),
                 )
                 output_path = Path.joinpath(
-                    self._output_dir, f"epoch_{epoch}", ADAPTER_MODEL_FNAME
+                    self._output_dir, output_dirname, ADAPTER_MODEL_FNAME
                 )
                 output_path.parent.mkdir(parents=True, exist_ok=True)
                 if not self._safe_serialization:
@@ -877,7 +884,7 @@ class FullModelHFCheckpointer(_CheckpointerInterface):
                 )
 
                 output_path = Path.joinpath(
-                    self._output_dir, f"epoch_{epoch}", ADAPTER_CONFIG_FNAME
+                    self._output_dir, output_dirname, ADAPTER_CONFIG_FNAME
                 ).with_suffix(".json")
                 with open(output_path, "w") as f:
                     json.dump(state_dict[training.ADAPTER_CONFIG], f)
@@ -891,7 +898,7 @@ class FullModelHFCheckpointer(_CheckpointerInterface):
         # So its easy to run inference with the model using this epoch's checkpoint
         copy_files(
             self._checkpoint_dir,
-            Path.joinpath(self._output_dir, f"epoch_{epoch}"),
+            Path.joinpath(self._output_dir, output_dirname),
             ignore_suffixes=SUFFIXES_TO_NOT_COPY,
         )
 

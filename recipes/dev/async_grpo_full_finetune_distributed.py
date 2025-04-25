@@ -7,21 +7,14 @@
 import functools
 import os
 import time
-
 from typing import Any, Dict
 
 import ray
-
 import torch
-import torch.distributed
-
-from omegaconf import DictConfig, OmegaConf
-
+from omegaconf import DictConfig
 from ray.util.queue import Queue
-
 from tensordict import TensorDict, TensorDictBase
 from tensordict.utils import expand_as_right
-
 from torchrl.data import LazyStackStorage, RayReplayBuffer
 from torchtune import config, utils
 from torchtune.dev.rl.datatypes import RequestOutput, Trajectory
@@ -35,7 +28,6 @@ from torchtune.dev.rl.workers import (
 )
 from torchtune.recipe_interfaces import OrchestrationRecipeInterface
 from vllm import SamplingParams
-
 from vllm.utils import get_ip, get_open_port
 
 log = utils.get_logger("DEBUG")
@@ -136,7 +128,7 @@ class RayGRPORecipe(OrchestrationRecipeInterface):
         self.num_postprocessing_workers = cfg.orchestration.num_postprocessing_workers
         self.num_training_workers = cfg.orchestration.num_training_workers
 
-        self.vllm_tp_size = cfg.inference.tp_size
+        self.vllm_tp_size = cfg.inference.tensor_parallel_dim
         # Initialize queues
         self.rollout_queue = Queue(
             actor_options={"num_cpus": 10, "num_gpus": 0},
@@ -268,9 +260,6 @@ class RayGRPORecipe(OrchestrationRecipeInterface):
             "log_probs",
         ]
 
-        vllm_addresses = self.vllm_addresses
-        vllm_ports = self.vllm_ports
-
         weight_update_receivers = [
             VLLMHFWeightUpdateReceiver(
                 vllm_master_address,
@@ -280,21 +269,20 @@ class RayGRPORecipe(OrchestrationRecipeInterface):
                 idx,
             )
             for idx, (vllm_master_address, vllm_update_port) in enumerate(
-                zip(vllm_addresses, vllm_ports)
+                zip(self.vllm_addresses, self.vllm_ports)
             )
         ]
 
         for i in range(self.num_inference_workers):
-
             collector = (
                 ray.remote(
                     num_cpus=0,
-                    num_gpus=self.cfg.inference.tp_size,
+                    num_gpus=self.cfg.inference.tensor_parallel_dim,
                 )(SyncLLMCollector)
                 .options(max_concurrency=5)
                 .remote(
                     cfg=self.cfg,
-                    llm="Qwen/Qwen2.5-3B",
+                    llm=self.cfg.inference.model,
                     policy=vllm_generate,
                     worker_id=i,
                     dialog_turns_per_batch=1,
@@ -320,6 +308,7 @@ class RayGRPORecipe(OrchestrationRecipeInterface):
         return workers
 
     def run(self):
+        # Start the workers
         rollout_handles = [worker.run.remote() for worker in self.rollout_workers]
         ref_handles = [worker.run.remote() for worker in self.ref_workers]
         worker_handles = [worker.train.remote() for worker in self.actor_workers]
@@ -327,15 +316,14 @@ class RayGRPORecipe(OrchestrationRecipeInterface):
         [ray.kill(w) for w in self.rollout_workers + self.ref_workers]
         ray.get(self.actor_workers[0].cleanup.remote())
 
-    def stop_ray(self):
-        ray.shutdown()
-
     def cleanup(self):
-        self.stop_ray()
+        ray.shutdown()
 
 
 @config.parse
 def recipe_main(cfg: DictConfig) -> None:
+    from omegaconf import OmegaConf
+
     OmegaConf.register_new_resolver("eval", eval)
     OmegaConf.resolve(cfg)
 

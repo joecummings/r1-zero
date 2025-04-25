@@ -1,42 +1,32 @@
-import functools
+# Copyright (c) Meta Platforms, Inc. and affiliates.
+# All rights reserved.
+#
+# This source code is licensed under the BSD-style license found in the
+# LICENSE file in the root directory of this source tree.
+
 import os
 import time
 from functools import partial
-from typing import Any, Dict, List, Optional, Union
-
-from warnings import warn
+from typing import Any, Dict, List, Optional, Tuple, Union
 
 import ray
 import torch
-import torch.distributed
 import torch.nn as nn
-import torchtune.training as training
-
-from omegaconf import DictConfig, ListConfig, OmegaConf
-
-from ray.util.queue import Full as QueueFull, Queue
-
-from readerwriterlock import rwlock
-from tensordict import is_tensorclass, NonTensorData, TensorClass, TensorDict
-
+from omegaconf import DictConfig
 from torch.optim import Optimizer
-
-from torchdata.stateful_dataloader import StatefulDataLoader
-from torchdata.stateful_dataloader.sampler import StatefulDistributedSampler
-
-from torchrl.data import LazyStackStorage, RayReplayBuffer
-from torchrl.envs import LLMEnv
-from torchtune import config, generation, modules, rlhf, utils
-from torchtune.dev.grpo.rewards import batched_rewards
+from torchrl.data import RayReplayBuffer
+from torchtune import config, training, utils
 from torchtune.dev.grpo.types import GRPOStats, GRPOTrajectory
 from torchtune.dev.rl.datatypes import Trajectory
 from torchtune.dev.rl.utils import stateless_init_process_group
+from torchtune.generation import (
+    get_causal_mask_from_padding_mask,
+    get_position_ids_from_padding_mask,
+)
 from torchtune.models.qwen2._convert_weights import qwen2_tune_to_hf
-
+from torchtune.modules.transformer import TransformerSelfAttentionLayer
+from torchtune.rlhf import truncate_sequence_at_first_stop_token
 from torchtune.training import DummyProfiler, PROFILER_KEY
-
-from vllm.utils import get_ip, get_open_port
-from vllm.worker.worker import Worker
 
 log = utils.get_logger("DEBUG")
 
@@ -51,50 +41,43 @@ class TrainingWorker:
 
     Args:
         cfg (DictConfig): Configuration object containing training parameters.
-        environment_variables (dict): Environment variables for distributed training setup.
-        replay_buffer: Shared replay buffer for sampling trajectories.
+        environment_variables (Dict[str, str]): Environment variables for distributed training setup.
+        replay_buffer (RayReplayBuffer): Shared replay buffer for sampling trajectories.
+
+    Raises:
+        RuntimeError: If enable_activation_offloading is True and enable_activation_checkpointing is False
     """
 
-    def __init__(self, cfg, environment_variables, replay_buffer):
-        import torch
-
-        self.replay_buffer = replay_buffer
+    def __init__(
+        self,
+        cfg: DictConfig,
+        environment_variables: Dict[str, str],
+        replay_buffer: RayReplayBuffer,
+    ):
         self.cfg = cfg
+        self.replay_buffer = replay_buffer
 
         # Device and dtype setup
-        self._device = utils.get_device(device=cfg.training.device_type)
-        self._dtype = training.get_dtype(cfg.training.dtype, device=self._device)
-
-        device_type = self.cfg.training.device_type
-        self._log_peak_memory_stats = cfg.get("log_peak_memory_stats", True)
-        if self._log_peak_memory_stats and device_type != "cuda":
-            log.info(
-                "log_peak_memory_stats was set to True, but training does not use cuda. Setting to False."
-            )
-            self._log_peak_memory_stats = False
-
-        if self._dtype == torch.float16:
-            raise ValueError(
-                "Full fp16 training is not supported. Use bf16 or fp32 instead."
-            )
+        device_type = "cuda"  # Harcoded for now
+        self._device = utils.get_device(device=device_type)
+        self._dtype = training.get_dtype("bf16", device=self._device)
 
         # Logging attributes
         self._output_dir = cfg.output_dir
         self._log_every_n_steps = cfg.get("log_every_n_steps", 1)
+        self._log_peak_memory_stats = cfg.get("log_peak_memory_stats", True)
 
         self.fsdp_cpu_offload = cfg.training.get("fsdp_cpu_offload", False)
         self.distributed_backend = training.get_distributed_backend(
             device_type, offload_ops_to_cpu=self.fsdp_cpu_offload
         )
-
         # Distributed training setup: Simulate torchrun environment
         for var in environment_variables:
             os.environ[var] = str(environment_variables[var])
 
         if not torch.distributed.is_initialized():
-            torch.distributed.init_process_group(backend="nccl")
+            torch.distributed.init_process_group(backend=self.distributed_backend)
 
-        world_size = torch.distributed.get_world_size()
         self.rank = int(os.environ["RANK"])
         self.world_size = int(os.environ["WORLD_SIZE"])
         self.fsdp_group = torch.distributed.new_group(
@@ -107,7 +90,6 @@ class TrainingWorker:
         self._is_rank_zero = self.rank == 0
 
         # Training configuration
-        self._resume_from_checkpoint = cfg.training.resume_from_checkpoint
         self._clip_grad_norm = cfg.training.get("clip_grad_norm", None)
 
         # Activation checkpointing and offloading
@@ -117,41 +99,28 @@ class TrainingWorker:
         self._enable_activation_offloading = cfg.training.get(
             "enable_activation_offloading", False
         )
-        if self._enable_activation_offloading:
-            if self._device.type != "cuda":
-                raise RuntimeError(
-                    "enable_activation_offloading should only be True when training on CUDA"
-                )
-            if not self._enable_activation_checkpointing:
-                raise RuntimeError(
-                    "enable_activation_offloading should only be True when enable_activation_checkpointing is True"
-                )
-        elif (
-            self._enable_activation_checkpointing
-            and cfg.checkpointer.model_type != "LLAMA3_VISION"
+        if (
+            self._enable_activation_offloading
+            and not self._enable_activation_checkpointing
         ):
-            utils.log_rank_zero(
-                log,
-                "Hint: enable_activation_checkpointing is True, but enable_activation_offloading isn't. "
-                "Enabling activation offloading should reduce memory further.",
+            raise RuntimeError(
+                "enable_activation_offloading should only be True when enable_activation_checkpointing is True"
             )
 
         # Recipe state
-        self.seed = training.set_seed(seed=cfg.seed)
-        self.total_epochs = cfg.training.epochs
+        self.seed = training.set_seed(seed=cfg.training.seed)
         self.global_step = 0
         self._steps_run = 0
         self._total_dialog_turns = cfg.orchestration.num_steps
-        self._epochs_run = 0
-        self._rng = torch.Generator(self._device).manual_seed(
-            self.seed
-        )  # TODO: Verify if needed for GRPO
 
         # RL parameters
+        self.save_every_n_steps = cfg.training.save_every_n_steps
         self._ppo_epochs = cfg.training.ppo_epochs
 
         # Model and optimizer setup
-        checkpoint_dict = self.load_checkpoint(cfg_checkpointer=cfg.checkpointer)
+        checkpoint_dict = self.load_checkpoint(
+            cfg_checkpointer=cfg.training.checkpointer
+        )
         self._compile = cfg.training.get("compile", False)
         self._model = self._setup_model(
             cfg_model=cfg.model,
@@ -175,17 +144,12 @@ class TrainingWorker:
         self._tokenizer = config.instantiate(self.cfg.tokenizer)
 
         # FIXME: need to get _steps_per_epoch when dataloader is no longer per fsdp worker but instead wrapped in vLLM
-        # self._lr_scheduler = self._setup_lr_scheduler(
-        #     cfg_lr_scheduler=cfg.get("lr_scheduler", None),
-        #     num_training_steps=self.total_epochs * self._steps_per_epoch,
-        #     last_epoch=self.global_step - 1,
-        # )
         self._lr_scheduler = None
 
         # Set up profiler, returns DummyProfiler (nullcontext object with no-op `step` method)
         # if cfg is missing profiler key or if `cfg.profiler.enabled = False`
         self._profiler = self._setup_profiler(cfg.get(PROFILER_KEY, None))
-        self._steps_before_sync = cfg.training.steps_before_sync
+        self._steps_before_sync = cfg.training.steps_before_weight_sync
 
         # Initialize policy version for tracking age of trajectories
         self.policy_version = 0
@@ -198,9 +162,7 @@ class TrainingWorker:
         log.info("Done setup")
 
     def set_metric_logger(self, logger):
-        """Store the MetricLoggerWorker handle for logging metrics."""
         if self._is_rank_zero:
-            log.info(f"Setting metric logger {logger} for rank {self.rank}")
             self._metric_logger = logger
 
     def _setup_profiler(
@@ -250,43 +212,10 @@ class TrainingWorker:
         """
         self._checkpointer = config.instantiate(
             cfg_checkpointer,
-            resume_from_checkpoint=self._resume_from_checkpoint,
+            resume_from_checkpoint=False,
         )
         checkpoint_dict = self._checkpointer.load_checkpoint()
-        if self._resume_from_checkpoint:
-            self._update_recipe_state(checkpoint_dict)
         return checkpoint_dict
-
-    def _update_recipe_state(self, ckpt_dict: Dict[str, Any]) -> None:
-        """Update recipe state from checkpoint."""
-        try:
-            self._epochs_run = ckpt_dict[training.EPOCHS_KEY]
-            self._rng.set_state(ckpt_dict[training.RNG_KEY])
-
-            # on mismatch, warn the user and prevent the override
-            if self.seed != ckpt_dict[training.SEED_KEY]:
-                warn(
-                    message=(
-                        "Config value for seed does not match the checkpoint value, "
-                        f"using the checkpoint value: {ckpt_dict[training.SEED_KEY]}"
-                    )
-                )
-                self.seed = ckpt_dict[training.SEED_KEY]
-
-            # on mismatch, warn the user but allow the override
-            if self.total_epochs != ckpt_dict[training.TOTAL_EPOCHS_KEY]:
-                warn(
-                    message=(
-                        "Config value for total_epochs does not match the checkpoint value, "
-                        f"using the config value: {self.total_epochs}"
-                    )
-                )
-
-        except KeyError as e:
-            raise KeyError(
-                "Checkpoint does not contain the required keys needed for updating recipe state. "
-                "Are you sure you passed in the right recipe checkpoint?"
-            ) from e
 
     def _setup_model(
         self,
@@ -320,7 +249,7 @@ class TrainingWorker:
 
         if enable_activation_checkpointing:
             training.set_activation_checkpointing(
-                model, auto_wrap_policy={modules.TransformerSelfAttentionLayer}
+                model, auto_wrap_policy={TransformerSelfAttentionLayer}
             )
 
         fsdp_shard_conditions = [
@@ -372,19 +301,9 @@ class TrainingWorker:
 
     def _setup_optimizer(
         self, cfg_optimizer: DictConfig, opt_state_dict=None
-    ) -> Optional[Optimizer]:
+    ) -> Optimizer:
         """Initialize the optimizer."""
         optimizer = config.instantiate(cfg_optimizer, self._model.parameters())
-
-        # TODO: does this work?
-        if opt_state_dict:
-            training.load_from_full_optimizer_state_dict(
-                self._model,
-                optimizer,
-                opt_state_dict,
-                self._device,
-            )
-
         utils.log_rank_zero(log, "Optimizer is initialized.")
         return optimizer
 
@@ -648,7 +567,7 @@ class TrainingWorker:
                 for token in response_tokens
             ]
 
-            ### Per-Sample Data
+            # Per-Sample Data
             per_sample_dict = {}
             per_sample_dict["Sequence ID"] = sequence_id
             per_sample_dict["prompt"] = prompt
@@ -711,9 +630,9 @@ class TrainingWorker:
                 )
             else:
                 beyond_seq_len = 0
-            per_sample_dict["beyond_seq_len_masking_is_positive (should be 0)"] = (
-                beyond_seq_len
-            )
+            per_sample_dict[
+                "beyond_seq_len_masking_is_positive (should be 0)"
+            ] = beyond_seq_len
 
             per_sample_dict["num_tokens_response"] = seq_len
             per_sample_dict["step"] = self._steps_run
@@ -721,7 +640,7 @@ class TrainingWorker:
             # Append the dictionary to the per-sample table data
             per_sample_table_data.append(per_sample_dict)
 
-            ### Per-Token Data
+            # Per-Token Data
             for pos in range(seq_len):
                 per_token_dict = {}
                 per_token_dict["Sequence ID"] = sequence_id
@@ -839,20 +758,18 @@ class TrainingWorker:
 
             # Synchronize weights
             time_weight_sync = time_weight_gather = 0
+            gathered_sd = None
             if self._steps_run % self._steps_before_sync == 0:
-                utils.log_rank_zero(log, "started weight gather")
                 torch.distributed.barrier(group=self.fsdp_group)
                 time_weight_gather_start = time.perf_counter()
-                new_sd = {
+                gathered_sd = {
                     k: v.full_tensor() for k, v in self._model.state_dict().items()
                 }
                 torch.cuda.synchronize()
                 time_weight_gather = time.perf_counter() - time_weight_gather_start
                 utils.log_rank_zero(log, f"Done gather in {time_weight_gather}")
                 time_sync_start = time.perf_counter()
-                utils.log_rank_zero(log, "started weight sync")
-                self.sync_weights(new_sd)
-                del new_sd
+                self.sync_weights(gathered_sd)
                 time_weight_sync = time.perf_counter() - time_sync_start
                 utils.log_rank_zero(log, f"Done sync in {time_weight_sync}")
 
@@ -877,6 +794,19 @@ class TrainingWorker:
                 log.info("done logging metrics")
 
             self.cleanup_after_step(trajectory, grpo_stats)
+
+            # Save a copy of the weights
+            if self._steps_run % self.save_every_n_steps == 0:
+                if gathered_sd is None:
+                    gathered_sd = {
+                        k: v.full_tensor() for k, v in self._model.state_dict().items()
+                    }
+                self._checkpointer.save_checkpoint(
+                    state_dict={training.MODEL_KEY: gathered_sd},
+                    epoch=0,
+                    step=self._steps_run,
+                )
+            del gathered_sd
 
             # Memory profiling stop
             self._profiler.step()
@@ -927,16 +857,14 @@ class TrainingWorker:
 
     def _prepare_trajectory(
         self, raw_trajectory: Trajectory
-    ) -> tuple[GRPOTrajectory, int, Dict[str, Any]]:
+    ) -> Tuple[GRPOTrajectory, int, Dict[str, Any]]:
         """Process raw trajectory, compute rewards, and prepare for optimization.
 
         Args:
-            raw_trajectory: The trajectory sampled from the replay buffer.
+            raw_trajectory (Trajectory): The trajectory sampled from the replay buffer.
 
         Returns:
-            trajectory (GRPOTrajectory): Processed trajectory for GRPO optimization.
-            context_length (int): Length of the context sequence.
-            metadata (dict): Metadata for logging
+            Tuple[trajectory, context_length, metadata]
         """
         # Extract components from raw trajectory
         query_responses = raw_trajectory.query_responses
@@ -957,19 +885,15 @@ class TrainingWorker:
         number_of_tokens = seq_lens.sum().item()
 
         # Truncate sequences at first stop token
-        response_padding_masks, responses = rlhf.truncate_sequence_at_first_stop_token(
+        response_padding_masks, responses = truncate_sequence_at_first_stop_token(
             responses,
             torch.tensor(self._tokenizer.stop_tokens, device=self._device),
             self._tokenizer.pad_id,
         )
 
         # Generate masks and position IDs
-        masks = generation.get_causal_mask_from_padding_mask(
-            query_response_padding_masks
-        )
-        position_ids = generation.get_position_ids_from_padding_mask(
-            query_response_padding_masks
-        )
+        masks = get_causal_mask_from_padding_mask(query_response_padding_masks)
+        position_ids = get_position_ids_from_padding_mask(query_response_padding_masks)
         context_length = query_responses.shape[1] - responses.shape[1]
         del query_response_padding_masks
 
