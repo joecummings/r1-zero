@@ -1,3 +1,9 @@
+# Copyright (c) Meta Platforms, Inc. and affiliates.
+# All rights reserved.
+#
+# This source code is licensed under the BSD-style license found in the
+# LICENSE file in the root directory of this source tree.
+
 import functools
 import os
 import time
@@ -92,9 +98,7 @@ class PyTorchActorModel:
             os.environ[var] = str(environment_variables[var])
 
         if not torch.distributed.is_initialized():
-            print("philip: initializing pg")
             torch.distributed.init_process_group(backend="nccl")
-        print("philip: pg started")
 
         world_size = torch.distributed.get_world_size()
         self.rank = int(os.environ["RANK"])
@@ -102,10 +106,11 @@ class PyTorchActorModel:
         self.fsdp_group = torch.distributed.new_group(
             ranks=list(range(self.world_size - 1)), use_local_synchronization=True
         )
-        print("philip: fsdp group started")
+
         self.device_mesh = torch.distributed.device_mesh.DeviceMesh.from_group(
             self.fsdp_group, device_type="cuda"
         )
+        print(self.device_mesh)
 
         self._is_rank_zero = self.rank == 0
 
@@ -376,9 +381,7 @@ class PyTorchActorModel:
         disable_dropout(model)
 
         # synchronize before training begins
-        print("philip: Model setup complete")
         torch.distributed.barrier(group=self.fsdp_group)
-        print("philip: Synchronized")
         return model
 
     def _setup_optimizer(

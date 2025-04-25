@@ -44,13 +44,11 @@ class DummyParamServer(WeightUpdateSenderBase):
 
         for k, v in env_vars.items():
             os.environ[k] = str(v)
-        print("Param server setting up")
         if not torch.distributed.is_initialized():
             torch.distributed.init_process_group(backend="nccl")
-        print("Param server initialized")
 
     def register_model_metadata(self, model_metadata):
-        self.state_dict = dict()
+        self.state_dicßt = dict()
         for k, (dtype, shape) in model_metadata.items():
             self.state_dict[k] = torch.empty(shape, dtype=dtype, device="cuda")
         self.version = 0
@@ -82,13 +80,13 @@ class DummyParamServer(WeightUpdateSenderBase):
 @pytest.fixture(params=[2, 1], autouse=True)
 def world_size(request):
     size = request.param + 1  # add 1 for param server
-    ray.init(num_cpus=4 * size, num_gpus=size)
+    num_cpus = 8 * request.param + 4 + 1  # trainers + param + metrics
+    ray.init(num_cpus=num_cpus, num_gpus=size)
     yield size
     ray.shutdown()
 
 
 class TestAsyncGRPOTrainerWorker:
-
     def _get_test_config_overrides(self, epochs: int = 2):
         return [
             "dtype=fp32",
@@ -100,6 +98,7 @@ class TestAsyncGRPOTrainerWorker:
             "max_steps_per_epoch=2",
             "optimizer=torch.optim.AdamW",
             "optimizer.lr=2e-5",
+            "num_steps=1",
             "log_every_n_steps=1",
             "grpo_samples=1",
             "temperature=0",
@@ -125,10 +124,10 @@ class TestAsyncGRPOTrainerWorker:
 
     @pytest.mark.integration_test
     @pytest.mark.parametrize(
-        "config, model_type, ckpt_type, micro_batch_size, gradient_accumulation_steps",
+        "config, model_type, ckpt_type, micro_batch_size, gradient_accumulation_steps, cpu_offload",
         [
-            ("llama3/8B_full", "llama3", "tune", 1, 4),
-            ("llama3/8B_full", "llama3", "tune", 4, 1),
+            ("llama3/8B_full", "llama3", "tune", 1, 4, False),
+            ("llama3/8B_full", "llama3", "tune", 4, 1, True),
         ],
     )
     @gpu_test(gpu_count=3)
@@ -139,6 +138,7 @@ class TestAsyncGRPOTrainerWorker:
         config,
         model_type,
         ckpt_type,
+        cpu_offload,
         world_size,
         tmpdir,
     ):
@@ -165,7 +165,7 @@ class TestAsyncGRPOTrainerWorker:
             tokenizer.prompt_template=null \
             metric_logger.filename={log_file} \
             "clip_grad_norm=100" \
-            "fsdp_cpu_offload=True" \
+            "fsdp_cpu_offload={cpu_offload}" \
         """.split()
         model_config = MODEL_TEST_CONFIGS[model_type]
         overrides += self._get_test_config_overrides() + model_config
@@ -180,7 +180,6 @@ class TestAsyncGRPOTrainerWorker:
         replay_buffer = [torch.randn((micro_batch_size, 100, 16)) for _ in range(10)]
         ip, port = get_ip(), get_open_port()
         num_trainers = world_size - 1
-        print(f"ip: {ip}, port: {port}")
         for i in range(num_trainers):
             env_vars = {
                 "RANK": str(i),
