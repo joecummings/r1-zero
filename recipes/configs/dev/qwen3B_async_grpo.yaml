@@ -110,7 +110,7 @@ training:
     epsilon: 0.2
 
 orchestration:
-  num_inference_workers: 4
+  num_inference_workers: 2
   num_postprocessing_workers: 1
   num_training_workers: 2
   replay_buffer_size: ${inference.batch_size}  # TODO this needs to be fixed. Right now this can't be bigger, or else we'll get padding issues
