@@ -53,11 +53,11 @@ def math_response_correct(
     attempt = math_verify.parse(potential_answer)
 
     if math_verify.verify(gold, attempt):
-        print("Gold")
+        print(f"Gold {answer=}, {potential_answer=}, {attempt=}")
         raise RuntimeError("Gold")
         return 100.0, 1.0
     if answer in potential_answer:
-        print("Silver")
+        print(f"Silver {answer=}, {potential_answer=}, {attempt=}")
         raise RuntimeError("Silver")
         return 50.0, 0.0
     if len(potential_answer) > 0:
