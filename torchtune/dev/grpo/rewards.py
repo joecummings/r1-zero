@@ -30,7 +30,7 @@ class RewardOutput:
     successes: torch.Tensor
     rewards: Optional[Dict[str, torch.Tensor]] = field(default_factory=dict)
 
-    def log(self, prefix: str = "") -> Dict[str, float]:
+    def log(self, prefix: str = "", idx: int = None) -> Dict[str, float]:
         """
         Logs the reward and other statistics for the given reward function.
 
@@ -62,10 +62,19 @@ class RewardOutput:
         """
         log_dict = {}
         prefix = f"{prefix}/{self.reward_base_name}" if prefix else self.reward_base_name
+
         for reward_name, reward in self.rewards.items():
-            log_dict[f"{prefix}/{reward_name}"] = reward.mean().item()
-        log_dict[f"{prefix}"] = self.total_reward.mean().item()
-        log_dict[f"{prefix}/successes"] = self.successes.mean().item()
+            if idx is None:
+                log_dict[f"{prefix}/{reward_name}"] = reward.mean().item()
+            else:
+                log_dict[f"{prefix}/{reward_name}"] = reward[idx].item()
+
+        if idx is None:
+            log_dict[f"{prefix}"] = self.total_reward.mean().item()
+            log_dict[f"{prefix}/successes"] = self.successes.mean().item()
+        else:
+            log_dict[f"{prefix}"] = self.total_reward[idx].item()
+            log_dict[f"{prefix}/successes"] = self.successes[idx].item()
         return log_dict
 
 

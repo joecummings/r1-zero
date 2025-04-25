@@ -4,7 +4,7 @@
 # This source code is licensed under the BSD-style license found in the
 # LICENSE file in the root directory of this source tree.
 
-from typing import Any, Dict
+from typing import Any, Dict, List
 
 import ray
 import torch
@@ -67,7 +67,8 @@ class PostProcessingWorker:
             self._tokenizer.stop_tokens, device=self._device
         )
 
-        self.reward_functions: List[RewardBase] = [config.instantiate(reward_fn) for reward_fn in self.cfg.reward_functions]
+        self.reward_functions: List[RewardBase] = [config.instantiate(
+            reward_fn) for reward_fn in self.cfg.reward_functions]
 
     def set_metric_logger(self, logger):
         """Store the MetricLoggerWorker handle."""
@@ -173,7 +174,6 @@ class PostProcessingWorker:
         for reward_output in reward_outputs:
             log_dict.update(reward_output.log(prefix="ref_actor_rewards"))
 
-
         ray.get(self._metric_logger.log_dict.remote(log_dict, step=step_idx))
 
     def run(self):
@@ -273,11 +273,12 @@ class PostProcessingWorker:
             reward_outputs: List[RewardOutput] = []
             for reward_fn in self.reward_functions:
                 reward_outputs.append(reward_fn(
-                    response_ids, responses_str, answers, device=self._device
+                    response_ids, responses_str, answers
                 ))
 
-            group_rewards = torch.stack([reward_output.total_reward for reward_output in reward_outputs], dim=-1) # (B * G, num_funcs)
-            group_rewards = group_rewards.reshape(batch_size, group_size, -1) 
+            group_rewards = torch.stack(
+                [reward_output.total_reward for reward_output in reward_outputs], dim=-1)  # (B * G, num_funcs)
+            group_rewards = group_rewards.reshape(batch_size, group_size, -1)
             # Compute advantages: B, G, num_funcs -> B, G
             group_rewards = group_rewards.sum(-1)
             # To compute advantage, subtract the mean of the group rewards from each group reward
@@ -299,6 +300,7 @@ class PostProcessingWorker:
                 advantages=group_advantages.reshape(batch_size * group_size),  # (B, G)
                 batch_size=batch_size * group_size,
                 sequence_ids=trajectory.sequence_ids,
+                reward_outputs=reward_outputs,
             )
 
             log.info(f"Constructed trajectory: {trajectory}")

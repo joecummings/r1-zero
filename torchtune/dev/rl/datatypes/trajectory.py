@@ -2,7 +2,7 @@ from typing import Dict, List
 
 import torch
 from tensordict import TensorClass
-
+from torchtune.dev.grpo.rewards import RewardOutput
 
 class Trajectory(TensorClass["nocast"]):
     query_responses: torch.Tensor
@@ -14,6 +14,5 @@ class Trajectory(TensorClass["nocast"]):
     answers: torch.Tensor
     policy_version: int
     advantages: torch.Tensor
-    successes: torch.Tensor
-    reward_metadata: Dict[str, List[str]]
+    rewards_outputs: List[RewardOutput]
     sequence_ids: List[str]

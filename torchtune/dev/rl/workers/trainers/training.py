@@ -27,7 +27,6 @@ from torchdata.stateful_dataloader.sampler import StatefulDistributedSampler
 from torchrl.data import LazyStackStorage, RayReplayBuffer
 from torchrl.envs import LLMEnv
 from torchtune import config, generation, modules, rlhf, utils
-from torchtune.dev.grpo.rewards import batched_rewards
 from torchtune.dev.grpo.types import GRPOStats, GRPOTrajectory
 from torchtune.dev.rl.datatypes import Trajectory
 from torchtune.dev.rl.utils import stateless_init_process_group
@@ -627,7 +626,6 @@ class TrainingWorker:
 
         # Iterate over each sample
         for idx in range(num_samples):
-            func_names = metadata["reward_metadata"][idx]["func_names"]
             sequence_id = metadata["sequence_ids"][idx]
             seq_len = grpo_trajectory.seq_lens[idx].item()
 
@@ -656,15 +654,8 @@ class TrainingWorker:
             per_sample_dict["answers"] = grpo_trajectory.answers[idx]
             per_sample_dict["policy_version"] = metadata["policy_version"][idx]
 
-            # Add rewards dynamically based on func_names
-            rewards = metadata["rewards"][idx].tolist()
-            for func_name, reward in zip(func_names, rewards):
-                per_sample_dict[f"reward_{func_name}"] = reward
-
-            # Add successes dynamically based on func_names
-            successes = metadata["successes"][idx].tolist()
-            for func_name, success in zip(func_names, successes):
-                per_sample_dict[f"success_{func_name}"] = success
+            for reward_output in metadata["reward_outputs"]:
+                per_sample_dict.update(reward_output.log(prefix="rewards", idx=idx))
 
             # Add GRPO statistics, handling per-sample vs. scalar cases
             # TODO: currently has one scalar per batch. We should enable a scalar per sentence.
@@ -946,11 +937,6 @@ class TrainingWorker:
         query_response_padding_masks = raw_trajectory.query_response_padding_masks
         seq_lens = raw_trajectory.seq_lens
 
-
-        answers = raw_trajectory.answers
-        policy_version = raw_trajectory.policy_version
-        rewards = raw_trajectory.rewards
-        successes = raw_trajectory.successes
         advantages = raw_trajectory.advantages
         answers = raw_trajectory.answers
 
@@ -1003,12 +989,10 @@ class TrainingWorker:
         metadata = {
             "padded_tokens_percentage": padded_tokens_percentage,
             "number_of_tokens": number_of_tokens,
-            "policy_version": policy_version,
             "avg_policy_age": avg_policy_age,
             "sequence_ids": raw_trajectory.sequence_ids,
             "policy_version": raw_trajectory.policy_version,
-            "rewards": raw_trajectory.rewards,
-            "successes": raw_trajectory.successes,
+            "reward_outputs": raw_trajectory.reward_outputs,
             "query_response_padding_masks": raw_trajectory.query_response_padding_masks,
         }
 

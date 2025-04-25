@@ -1,0 +1,69 @@
+# tests/torchtune/dev/grpo/test_rewards.py
+import torch
+import pytest
+from torchtune.dev.grpo.rewards import RewardOutput
+
+
+class TestRewardOutput:
+
+    @pytest.fixture
+    def sample_reward_output(self):
+        return RewardOutput(
+            reward_base_name="test_reward",
+            total_reward=torch.tensor([1.0, 2.0, 3.0]),
+            successes=torch.tensor([1.0, 0.0, 1.0]),
+            rewards={
+                "sub_reward_1": torch.tensor([0.5, 1.5, 2.5]),
+                "sub_reward_2": torch.tensor([10.0, 20.0, 30.0])
+            }
+        )
+
+    def test_log(self, sample_reward_output):
+        log_dict = sample_reward_output.log(prefix="train")
+        expected_log = {
+            "train/test_reward/sub_reward_1": 1.5,
+            "train/test_reward/sub_reward_2": 20.0,
+            "train/test_reward": 2.0,
+            "train/test_reward/successes": 2.0 / 3.0
+        }
+        assert log_dict.keys() == expected_log.keys()
+        for key in expected_log:
+            assert log_dict[key] == pytest.approx(expected_log[key])
+
+    def test_log_with_index(self, sample_reward_output):
+        idx_to_test = 1
+        log_dict = sample_reward_output.log(prefix="eval", idx=idx_to_test)
+        expected_log = {
+            "eval/test_reward/sub_reward_1": 1.5,
+            "eval/test_reward/sub_reward_2": 20.0,
+            "eval/test_reward": 2.0,
+            "eval/test_reward/successes": 0.0
+        }
+        assert log_dict.keys() == expected_log.keys()
+        for key in expected_log:
+            assert log_dict[key] == pytest.approx(expected_log[key])
+
+    def test_log_no_prefix(self, sample_reward_output):
+        log_dict = sample_reward_output.log()
+        expected_log = {
+            "test_reward/sub_reward_1": 1.5,
+            "test_reward/sub_reward_2": 20.0,
+            "test_reward": 2.0,
+            "test_reward/successes": 2.0 / 3.0
+        }
+        assert log_dict.keys() == expected_log.keys()
+        for key in expected_log:
+            assert log_dict[key] == pytest.approx(expected_log[key])
+
+    def test_log_no_sub_rewards(self):
+        reward_output = RewardOutput(
+            reward_base_name="simple_reward",
+            total_reward=torch.tensor([5.0, 10.0]),
+            successes=torch.tensor([1.0, 1.0])
+        )
+        log_dict = reward_output.log(prefix="test")
+        expected_log = {
+            "test/simple_reward": 7.5,
+            "test/simple_reward/successes": 1.0
+        }
+        assert log_dict == expected_log
