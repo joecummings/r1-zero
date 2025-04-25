@@ -101,7 +101,7 @@ class SyncLLMCollector(SyncDataCollector):
         env = LLMEnv.from_dataloader(
             dataloader=dataloader,
             tokenizer=None,
-            str2str=True,
+            from_text=True,
             batch_size=self.batch_size,
             repeats=self.cfg.grpo_samples,
         )
