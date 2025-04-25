@@ -618,7 +618,6 @@ class TrainingWorker:
         num_samples = min(
             self.debug_num_samples_per_step, grpo_trajectory.query_responses.size(0)
         )
-        print(f"query responses size: {grpo_trajectory.query_responses.size(0)}")
         # Extract response tokens
         targets = grpo_trajectory.query_responses[:, context_length:]
         per_sample_table_data = []
