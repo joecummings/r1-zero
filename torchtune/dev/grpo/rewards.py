@@ -54,11 +54,9 @@ def math_response_correct(
 
     if math_verify.verify(gold, attempt):
         print(f"Gold {answer=}, {potential_answer=}, {attempt=}")
-        raise RuntimeError("Gold")
         return 100.0, 1.0
     if answer in potential_answer:
         print(f"Silver {answer=}, {potential_answer=}, {attempt=}")
-        raise RuntimeError("Silver")
         return 50.0, 0.0
     if len(potential_answer) > 0:
         return 1.0, 0.0
@@ -96,6 +94,8 @@ def batched_rewards(
                 reward, success = reward_func(cot, answer, potential_answer)
                 rewards_tensor[b, g, rw_idx] += reward
                 successes_tensor[b, g, rw_idx] += success
+            print('successes_tensor for batch', successes_tensor[b])
+            raise RuntimeError(successes_tensor[b].sum(), "successes")
 
     return rewards_tensor, successes_tensor, metadata
 
