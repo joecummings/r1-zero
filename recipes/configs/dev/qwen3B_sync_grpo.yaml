@@ -1,27 +1,26 @@
-# Config for multi-node GRPO in dev/grpo_full_finetune_distributed.py
-# using a Llama3.2 3B Base model
+# Config for sync multi-node GRPO in dev/grpo_full_finetune_distributed.py
+# using a Qwen-3B Base model (which is known to train quickly on this task).
+#
+# Also check out the async implementation of this workflow in this directory.
 #
 # This config assumes that you've run the following command before launching
 # this run:
-#   tune download meta-llama/Llama-3.2-3B --output-dir /tmp/Llama-3.2-3B --ignore-patterns "original/consolidated.00.pth"
+#   tune download Qwen/Qwen2.5-3B --output-dir /tmp/Qwen2.5-3B
 #
-# It can be beneficial to first train the base model with SFT using the 3B_sft recipe.
-#
-# To launch on 8 devices, run the following command from root:
-# tune run --nproc-per-node 8 dev/grpo_full_finetune_distributed --config recipes/configs/dev/qwen3B_full_grpo.yaml
+# To launch on 4 devices, run the following command from root:
+# tune run --nproc_per_node 8 dev/grpo_full_finetune_distributed --config dev/qwen3B_sync_grpo
 #
 # You can add specific overrides through the command line. For example
 # to override the checkpointer directory while launching training
 # you can run:
-#   tune run --nproc_per_node 4 dev/grpo_full_finetune_distributed --config dev/grpo/3B_full_rl checkpointer.checkpoint_dir=<YOUR_CHECKPOINT_DIR>
+#   tune run --nproc_per_node 4 dev/grpo_full_finetune_distributed --config dev/qwen3B_sync_grpo checkpointer.checkpoint_dir=<YOUR_CHECKPOINT_DIR>
 #
 # This config works best when the model is being fine-tuned on 2+ GPUs.
 #
 # Furthermore, you can launch it on multiple nodes by going to recipes/dev/ and using
 #  sbatch multinode_grpo.sbatch
 
-name: grpo_qwen3b
-total_inference_batch_size: ${eval:'${vllm.batch_size} * ${grpo_samples}'}
+name: grpo_async_qwen3b
 
 output_dir: /tmp/checkpoints/${name}
 base_model_path: /tmp/Qwen2.5-3B  # Use this to train from the slightly trained SFT model
@@ -72,16 +71,16 @@ resume_from_checkpoint: False
 save_every_n_epochs: 1
 
 # Fine-tuning arguments
-batch_size: 16
+batch_size: 1
 grpo_samples: 16
+forward_batch_size: 1
 max_generated_tokens: 512
 top_k: null
 temperature: 1.0
-replay_buffer_size: ${total_inference_batch_size}  # TODO this needs to be fixed. Right now this can't be bigger, or else we'll get padding issues
 
 ppo_epochs: 1
 
-num_steps: 250
+num_steps: 200
 
 clip_grad_norm: 1.0
 
@@ -94,7 +93,7 @@ lr_scheduler:
   _component_: torchtune.training.lr_schedulers.get_cosine_schedule_with_warmup
   num_warmup_steps: 50
 loss:
-  _component_: torchtune.dev.grpo.loss.GRPOWithChunkedOutputLoss
+  _component_: torchtune.dev.grpo.loss.GRPOSimpleLoss
   kl_coeff: 0.01
   epsilon: 0.2
 
@@ -103,7 +102,6 @@ device: cuda
 
 # Memory management
 enable_activation_checkpointing: True  # True reduces memory
-enable_activation_offloading: True  # True reduces memory.
 compile: False  # pytorch compile, set to true for better perf/memory
 
 # Reduced precision
@@ -142,7 +140,7 @@ log_peak_memory_stats: True
 # Profiler (disabled)
 profiler:
   _component_: torchtune.training.setup_torch_profiler
-  enabled: False
+  enabled: True
 
   #Output directory of trace artifacts
   output_dir: ${output_dir}/profiling_outputs
@@ -159,7 +157,7 @@ profiler:
 
   # `torch.profiler.schedule` options:
   # wait_steps -> wait, warmup_steps -> warmup, active_steps -> active, num_cycles -> repeat
-  wait_steps: 1
-  warmup_steps: 1
+  wait_steps: 5
+  warmup_steps: 3
   active_steps: 2
   num_cycles: 1

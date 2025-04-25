@@ -1,31 +1,33 @@
+# Copyright (c) Meta Platforms, Inc. and affiliates.
+# All rights reserved.
+#
+# This source code is licensed under the BSD-style license found in the
+# LICENSE file in the root directory of this source tree.
+
 import time
 from functools import partial
-from typing import Any, Dict, Optional
+from typing import Any, Callable, Dict, Optional
 
 import ray
 import torch
 import torch.distributed
-import torchtune.training as training
-import vllm
 
 from omegaconf import DictConfig, ListConfig
 
 from ray.util.queue import Full as QueueFull
-
-from tensordict import lazy_stack, TensorDictBase
+from tensordict import lazy_stack, NonTensorStack, TensorDictBase
 from torchdata.stateful_dataloader import StatefulDataLoader
 from torchdata.stateful_dataloader.sampler import StatefulDistributedSampler
 from torchrl.collectors import (
-    LocalWeightUpdaterBase,
-    RemoteWeightUpdaterBase,
     SyncDataCollector,
+    WeightUpdateReceiverBase,
+    WeightUpdateSenderBase,
 )
 
-from torchrl.envs import LLMEnv
-from torchtune import config, utils
+from torchtune import utils
 from torchtune.dev.rl.datatypes import Trajectory
 from torchtune.dev.rl.utils import stateless_init_process_group
-from vllm import LLM, SamplingParams
+from vllm import LLM
 from vllm.worker.worker import Worker
 
 log = utils.get_logger()
@@ -47,8 +49,12 @@ class SyncLLMCollector(SyncDataCollector):
         total_dialog_turns: int = -1,
         async_envs: bool = False,
         reset_at_each_iter: bool = False,
-        local_weight_updater: LocalWeightUpdaterBase | None = None,
-        remote_weight_updater: RemoteWeightUpdaterBase | None = None,
+        weight_update_receiver: (
+            WeightUpdateReceiverBase | Callable[[], WeightUpdateReceiverBase] | None
+        ) = None,
+        weight_update_sender: (
+            WeightUpdateSenderBase | Callable[[], WeightUpdateSenderBase] | None
+        ) = None,
     ):
         if async_envs:
             raise NotImplementedError
@@ -57,9 +63,11 @@ class SyncLLMCollector(SyncDataCollector):
         self.rollout_queue = queue
         self.worker_id = worker_id
         self._is_collector_zero = self.worker_id == 0
+        print(f"{self._is_collector_zero=}")
 
-        self.tp_size = self.cfg.vllm.tp_size
-        self.batch_size = self.cfg.vllm.batch_size
+        self.tp_size = self.cfg.inference.tp_size
+        self.batch_size = self.cfg.inference.batch_size
+        self._sequence_counter = 0  # Used to assign unique sequence IDs to each sample
 
         self.inference_server = LLM(
             model="Qwen/Qwen2.5-3B",
@@ -78,8 +86,8 @@ class SyncLLMCollector(SyncDataCollector):
         policy_kwargs = {
             "generate_kwargs": dict(
                 n=1,
-                max_tokens=self.cfg.max_generated_tokens,
-                temperature=self.cfg.temperature,
+                max_tokens=self.cfg.inference.max_generated_tokens,
+                temperature=self.cfg.inference.temperature,
             ),
             "pad_output": True,
             "padding_value": self._tokenizer.pad_id,
@@ -103,9 +111,9 @@ class SyncLLMCollector(SyncDataCollector):
         env = LLMEnv.from_dataloader(
             dataloader=dataloader,
             tokenizer=None,
-            str2str=True,
+            from_text=True,
             batch_size=self.batch_size,
-            repeats=self.cfg.grpo_samples,
+            repeats=self.cfg.inference.group_size,
         )
 
         super().__init__(
@@ -113,8 +121,8 @@ class SyncLLMCollector(SyncDataCollector):
             policy=policy,
             frames_per_batch=dialog_turns_per_batch,
             total_frames=total_dialog_turns,
-            local_weight_updater=local_weight_updater,
-            remote_weight_updater=remote_weight_updater,
+            weight_update_receiver=weight_update_receiver,
+            weight_update_sender=weight_update_sender,
             reset_at_each_iter=reset_at_each_iter,
             use_buffers=False,
             # This argument allows a non-TensorDictModule policy to be assumed
@@ -123,14 +131,6 @@ class SyncLLMCollector(SyncDataCollector):
         )
 
         log.info("done init LLMCollector")
-
-    @property
-    def remote_weight_updater(self) -> RemoteWeightUpdaterBase:
-        return self._remote_weight_updater
-
-    @remote_weight_updater.setter
-    def remote_weight_updater(self, value: RemoteWeightUpdaterBase | None):
-        self._remote_weight_updater = value
 
     def _postprocess_for_queue(self, data):
         # local import to avoid vLLM no CUDA GPUs available error
@@ -157,6 +157,18 @@ class SyncLLMCollector(SyncDataCollector):
         seq_lens = training.get_unmasked_sequence_lengths(response_padding_masks)
         del response_padding_masks
 
+        # Generate unique sequence IDs for the batch
+        # FIXME: it outputs a List[List[str]] when sampling from replay buffer, with shape num_samples X 16.
+        # It should have shape num_samplesX1, so we can log a single sequence_id per sequence.
+        batch_size = query_responses.shape[0]
+        sequence_ids = NonTensorStack(
+            *[
+                f"worker{self.worker_id}_{self._sequence_counter + i}"
+                for i in range(batch_size)
+            ]
+        )
+        self._sequence_counter += batch_size
+
         postprocessed_results = Trajectory(
             query_responses=query_responses,
             responses=response_tokens,
@@ -167,22 +179,17 @@ class SyncLLMCollector(SyncDataCollector):
             answers=answers,
             policy_version=policy_version,
             advantages=None,
+            successes=None,
+            reward_metadata=None,
+            sequence_ids=sequence_ids,
         )
 
         total_generated_tokens = seq_lens.sum().item()
         return postprocessed_results, total_generated_tokens
 
-    def update_policy_weights_(
-        self,
-        policy_weights: TensorDictBase | None = None,
-        *,
-        worker_ids: int | list[int] | torch.device | list[torch.device] | None = None,
-        **kwargs,
-    ) -> None:
-        self.local_weight_updater(policy_weights, **kwargs)
-
     def set_metric_logger(self, logger):
-        """Store the MetricLoggerActor handle."""
+        """Store the MetricLoggerWorker handle."""
+        print(f"{self._is_collector_zero=} setting metric logger")
         if self._is_collector_zero:
             self._metric_logger = logger
 
@@ -228,16 +235,13 @@ class SyncLLMCollector(SyncDataCollector):
         ray.get(self._metric_logger.log_dict.remote(log_dict, step=step_idx))
 
     def run(self):
-        num_steps = (self.cfg.num_steps // self.cfg.vllm.num_workers) + 1
-        for i in range(num_steps):
+        i = 0
+        while True:
             self.rollout(i)
-            if i % self.cfg.vllm.steps_before_sync == 0:
+            if i % self.cfg.inference.steps_before_sync == 0:
                 log.info(f"{self.worker_id} about to update weights")
-                ray.get(
-                    self.remote_weight_updater.update_weights.remote(
-                        weights=None, worker_ids=self.worker_id
-                    )
-                )
+                self.update_policy_weights_()
+            i += 1
 
     def rollout(self, idx) -> TensorDictBase:
         if self.reset_at_each_iter or self._shuttle is None:

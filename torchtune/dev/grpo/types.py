@@ -4,11 +4,10 @@
 # This source code is licensed under the BSD-style license found in the
 # LICENSE file in the root directory of this source tree.
 
-from typing import NamedTuple
+
+from typing import NamedTuple, Optional
 
 import torch
-
-# from tensordict.tensorclass import TensorClass
 
 
 class GRPOTrajectory(NamedTuple):
@@ -24,6 +23,7 @@ class GRPOTrajectory(NamedTuple):
         position_ids (torch.Tensor): Position IDs for input ids-generated responses pairs with shape [B x G, P+L].
         response_padding_masks (torch.Tensor): Padding masks for the truncated and padded generated responses with shape [B x G, L].
         seq_lens (torch.Tensor): Sequence lengths of truncated generated responses.
+        answers (str): List of answers for the generated responses. [B x G]
     """
 
     query_responses: torch.Tensor = None  # [B x G, P+L]
@@ -34,6 +34,7 @@ class GRPOTrajectory(NamedTuple):
     position_ids: torch.Tensor = None  # [B x G, P+L]
     response_padding_masks: torch.Tensor = None  # [B x G, L]
     seq_lens: torch.Tensor = None
+    answers: str = None
 
 
 class GRPOStats(NamedTuple):
@@ -47,6 +48,7 @@ class GRPOStats(NamedTuple):
         ratios (torch.Tensor): The ratio between the current and old policy probabilities.
         clipfrac (torch.Tensor): The fraction of ratios that were clipped.
         approx_policy_kls (torch.Tensor): Average estimated KL divergence between the policy before and after the optimization step.
+        metadata (Optional[dict]): Additional metadata to be logged.
     """
 
     loss: torch.Tensor
@@ -55,3 +57,4 @@ class GRPOStats(NamedTuple):
     ratios: torch.Tensor
     clipfrac: torch.Tensor
     approx_policy_kls: torch.Tensor
+    metadata: Optional[dict] = None
