@@ -16,8 +16,8 @@ from tensordict import lazy_stack, TensorDictBase
 from torchdata.stateful_dataloader import StatefulDataLoader
 from torchdata.stateful_dataloader.sampler import StatefulDistributedSampler
 from torchrl.collectors import (
-    LocalWeightUpdaterBase,
-    RemoteWeightUpdaterBase,
+    WeightUpdateSenderBase as LocalWeightUpdaterBase,
+    WeightUpdateReceiverBase as RemoteWeightUpdaterBase,
     SyncDataCollector,
 )
 
