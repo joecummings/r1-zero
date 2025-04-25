@@ -778,7 +778,7 @@ class GRPOFullFinetuneRecipeDistributed(FTRecipeInterface):
     #  - the collector needs to have a weight sync function
     #  - the collector needs to watch over the
     def data_collection(self):
-        from torchrl.envs import LLMEnv
+        from torchtune.dev.grpo.envs import LLMEnv
 
         # Setup env:
         # - batch-size indicates how many elements we want to get from the replay buffer

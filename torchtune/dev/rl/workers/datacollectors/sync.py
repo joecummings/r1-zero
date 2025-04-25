@@ -21,7 +21,8 @@ from torchrl.collectors import (
     SyncDataCollector,
 )
 
-from torchrl.envs import LLMEnv
+from torchtune.dev.grpo.envs import LLMEnv
+
 from torchtune import config, utils
 from torchtune.dev.rl.datatypes import Trajectory
 from torchtune.dev.rl.utils import stateless_init_process_group
