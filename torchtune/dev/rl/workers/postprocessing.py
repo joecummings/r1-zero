@@ -12,7 +12,7 @@ import torchtune.training as training
 from omegaconf import DictConfig
 
 from torchtune import config, generation, rlhf, utils
-from torchtune.dev.grpo.rewards import RewardOutput, RewardBase
+from torchtune.dev.grpo.rewards import RewardOutput, Reward
 from torchtune.dev.rl.datatypes import Trajectory
 
 log = utils.get_logger("DEBUG")
@@ -67,7 +67,7 @@ class PostProcessingWorker:
             self._tokenizer.stop_tokens, device=self._device
         )
 
-        self.reward_functions: List[RewardBase] = [config.instantiate(
+        self.reward_functions: List[Reward] = [config.instantiate(
             reward_fn) for reward_fn in self.cfg.reward_functions]
 
     def set_metric_logger(self, logger):
