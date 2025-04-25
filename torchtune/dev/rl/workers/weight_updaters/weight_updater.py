@@ -32,28 +32,29 @@ class VLLMHFWeightUpdateReceiver(WeightUpdateReceiverBase):
         return None
 
     def _update_local_weights(self, local_weights, mapped_weights):
-        should_update = not ray.get(
-            self.param_server._skip_update.remote(self.worker_idx)
-        )
-        if should_update:
-            self.param_server._sync_weights_with_worker.remote(self.worker_idx)
-            inference_server = self.collector.inference_server
-            if self.initialized_group is None:
-                weight_sync_world_size = (
-                    inference_server.llm_engine.parallel_config.tensor_parallel_size + 1
-                )
-                inference_server.collective_rpc(
-                    "init_weight_update_group",
-                    args=(
-                        self.master_address,
-                        self.master_port,
-                        1,
-                        weight_sync_world_size,
-                    ),
-                )
-                self.initialized_group = True
+        should_update = False
+        while not should_update:
+            should_update = not ray.get(
+                self.param_server._skip_update.remote(self.worker_idx)
+            )
+        self.param_server._sync_weights_with_worker.remote(self.worker_idx)
+        inference_server = self.collector.inference_server
+        if self.initialized_group is None:
+            weight_sync_world_size = (
+                inference_server.llm_engine.parallel_config.tensor_parallel_size + 1
+            )
+            inference_server.collective_rpc(
+                "init_weight_update_group",
+                args=(
+                    self.master_address,
+                    self.master_port,
+                    1,
+                    weight_sync_world_size,
+                ),
+            )
+            self.initialized_group = True
 
-            for k, (dtype, shape) in self.model_metadata.items():
-                inference_server.collective_rpc("update_weight", args=(k, dtype, shape))
+        for k, (dtype, shape) in self.model_metadata.items():
+            inference_server.collective_rpc("update_weight", args=(k, dtype, shape))
 
-            inference_server.collective_rpc("update_policy_version")
+        inference_server.collective_rpc("update_policy_version")

@@ -1,3 +1,9 @@
+# Copyright (c) Meta Platforms, Inc. and affiliates.
+# All rights reserved.
+#
+# This source code is licensed under the BSD-style license found in the
+# LICENSE file in the root directory of this source tree.
+
 import ray
 import torch
 from readerwriterlock import rwlock
@@ -72,9 +78,9 @@ class VLLMParameterServer:
         if worker_id not in self.vllm_weight_versions:
             return False
         if self.vllm_weight_versions[worker_id] == self.version:
-            log.info(
-                f"skipping update for {worker_id=}, {self.version=}, {self.vllm_weight_versions[worker_id]=}"
-            )
+            # log.info(
+            #     f"skipping update for {worker_id=}, {self.version=}, {self.vllm_weight_versions[worker_id]=}"
+            # )
             return True
         return False
 
