@@ -2,8 +2,8 @@ import ray
 import torch
 from readerwriterlock import rwlock
 from torchrl.collectors.collectors import (
-    WeightUpdateSenderBase as LocalWeightUpdaterBase,
-    WeightUpdateReceiverBase as RemoteWeightUpdaterBase,
+    WeightUpdateReceiverBase as LocalWeightUpdaterBase,
+    WeightUpdateSenderBase as RemoteWeightUpdaterBase,
 )
 from torchtune.dev.rl.utils import stateless_init_process_group
 from torchtune.utils import get_logger

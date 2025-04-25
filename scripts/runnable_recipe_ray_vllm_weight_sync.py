@@ -57,7 +57,7 @@ from omegaconf import DictConfig, OmegaConf
 from ray.util.queue import Queue
 from torch.optim import Optimizer
 from torchrl.collectors import (
-    WeightUpdateSenderBase as LocalWeightUpdaterBase,
+    WeightUpdateReceiverBase as LocalWeightUpdaterBase,
 )
 from torchrl.data import LazyStackStorage, RayReplayBuffer
 from vllm.utils import get_ip, get_open_port
