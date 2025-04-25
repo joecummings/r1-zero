@@ -4,8 +4,6 @@
 # This source code is licensed under the BSD-style license found in the
 # LICENSE file in the root directory of this source tree.
 
-import functools
-
 import time
 
 import pytest
@@ -15,9 +13,8 @@ from omegaconf import OmegaConf
 from ray.util.queue import Queue
 from tensordict import NonTensorData
 from tests.test_utils import gen_log_file_name, gpu_test
-from torchrl.data import LazyStackStorage, RayReplayBuffer
 from torchtune.dev.rl.datatypes.trajectory import Trajectory
-from torchtune.dev.rl.workers.ref_actor import RefActor
+from torchtune.dev.rl.workers.postprocessing import PostProcessingWorker
 
 grpo_samples = 4
 max_generated_tokens = 32
@@ -67,7 +64,7 @@ def rollout_queue():
     return queue
 
 
-class TestRefActor:
+class TestPostProcessingWorker:
     @pytest.fixture
     def log_file(self, tmpdir):
         return gen_log_file_name(tmpdir)
@@ -103,27 +100,19 @@ class TestRefActor:
                 "log_dir": str(tmpdir),
                 "filename": log_file,
             },
+            "postprocessing": {
+                "device_type": "cuda",
+                "dtype": "bf16",
+            },
             "output_dir": str(tmpdir),
-            "temperature": 1.0,
-            "grpo_samples": 4,
-            "vllm": {"batch_size": 1},
+            "inference": {
+                "group_size": grpo_samples,
+                "batch_size": 1,
+                "temperature": 1.0,
+            },
             "num_steps": 3,
         }
         return OmegaConf.create(cfg)
-
-    @pytest.fixture
-    def replay_buffer(self):
-        return RayReplayBuffer(
-            storage=functools.partial(LazyStackStorage, max_size=16),
-            batch_size=1,
-            remote_config={"num_cpus": 10, "num_gpus": 0},
-        )
-
-    @pytest.fixture
-    def ref_actor(self, cfg, rollout_queue, replay_buffer):
-        return RefActor.remote(
-            cfg=cfg, rollout_queue=rollout_queue, replay_buffer=replay_buffer
-        )
 
     @pytest.mark.integration_test
     @gpu_test(gpu_count=1)
@@ -167,7 +156,7 @@ class TestRefActor:
             replay_buffer = []
 
             # Ref actor handle
-            ref_actor = RefActor.remote(
+            ref_actor = PostProcessingWorker.remote(
                 cfg=cfg,
                 rollout_queue=rollout_queue,
                 replay_buffer=replay_buffer,
