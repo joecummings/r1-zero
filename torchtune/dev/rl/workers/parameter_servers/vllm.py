@@ -1,3 +1,9 @@
+# Copyright (c) Meta Platforms, Inc. and affiliates.
+# All rights reserved.
+#
+# This source code is licensed under the BSD-style license found in the
+# LICENSE file in the root directory of this source tree.
+
 import ray
 import torch
 from readerwriterlock import rwlock
@@ -98,8 +104,12 @@ class VLLMParameterServer:
         read_lock = self.state_dict_lock.gen_rlock()
         read_lock.acquire()
         for i, k in enumerate(server_weights.keys()):
+            p = server_weights[k]
+            if self.version_tensor <= 1:
+                print(f"Messing up params {k=}")
+                p.data = p.data + torch.randn_like(p.data) * 0.01
             self.vllm_comm_groups[worker_id].broadcast(
-                server_weights[k], src=0, stream=torch.cuda.current_stream()
+                p, src=0, stream=torch.cuda.current_stream()
             )
         self.vllm_comm_groups[worker_id].broadcast(
             self.version_tensor, src=0, stream=torch.cuda.current_stream()
