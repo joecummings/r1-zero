@@ -9,7 +9,7 @@ from typing import Union
 
 import torch
 from torch import nn
-from torchtune.dev.grpo.loss import GRPOWithChunkedOutputLoss
+from torchtune.dev.rl.loss import GRPOWithChunkedOutputLoss
 
 from torchtune.modules import (
     TransformerCrossAttentionLayer,
