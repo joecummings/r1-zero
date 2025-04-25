@@ -386,10 +386,6 @@ class PyTorchActorModel:
         self, cfg_optimizer: DictConfig, opt_state_dict=None
     ) -> Optional[Optimizer]:
         """Initialize the optimizer."""
-        # TODO: remove this
-        print('Messing up params!')
-        for p in self._model.parameters():
-            p.data.copy_(p.data + torch.randn_like(p.data) * 0.001)
         optimizer = config.instantiate(cfg_optimizer, self._model.parameters())
 
         # TODO: does this work?
