@@ -95,7 +95,7 @@ training:
   dtype: bf16
 
   # number of train_steps after which to do weight sync
-  steps_before_sync: 2
+  steps_before_sync: 1
 
   optimizer:
     _component_: torch.optim.AdamW

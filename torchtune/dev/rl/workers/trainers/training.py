@@ -782,11 +782,16 @@ class TrainingWorker:
             if self._is_rank_zero:
                 train_replay_buffer_size = len(self.replay_buffer)
 
-            while not len(self.replay_buffer):
-                log.info("waiting for replay buffer")
-                time.sleep(1.0)
+            while True:
+                while not len(self.replay_buffer):
+                    log.info("waiting for replay buffer")
+                    time.sleep(1.0)
 
-            trajectory = self.replay_buffer.sample().to(self._device)
+                trajectory = self.replay_buffer.sample().to(self._device)
+                # print(f"GETTING {self.policy_version=} {trajectory.policy_version[0]=}")
+                if trajectory.policy_version[0] == self.policy_version:
+                    print("GOT TRAJECTORY")
+                    break
             time_waiting_buffer = time.perf_counter() - time_waiting_buffer_start
             if self._is_rank_zero:
                 log.info(f"{self.rank=} got from queue traj {trajectory}")
