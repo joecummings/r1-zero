@@ -30,19 +30,58 @@ from tests.test_utils import (
     gpu_test,
     TOKENIZER_PATHS,
 )
-from torchtune.dev.rl.workers import MetricLoggerActor, PyTorchActorModel
 
-from torchtune.training.checkpointing._utils import (
-    get_largest_iter_folder,
-    RECIPE_STATE_DIRNAME,
-    SHARD_FNAME,
-)
+from torchrl.collectors.collectors import WeightUpdateSenderBase
+from torchtune.dev.rl.workers import MetricLoggerActor, PyTorchActorModel
 from vllm.utils import get_ip, get_open_port
+
+
+@ray.remote(num_cpus=4, num_gpus=1)
+class DummyParamServer(WeightUpdateSenderBase):
+    def __init__(self, env_vars):
+        super().__init__()
+        torch.cuda.set_device(torch.device("cuda", 0))
+
+        for k, v in env_vars.items():
+            os.environ[k] = str(v)
+        print("Param server setting up")
+        if not torch.distributed.is_initialized():
+            torch.distributed.init_process_group(backend="nccl")
+        print("Param server initialized")
+
+    def register_model_metadata(self, model_metadata):
+        self.state_dict = dict()
+        for k, (dtype, shape) in model_metadata.items():
+            self.state_dict[k] = torch.empty(shape, dtype=dtype, device="cuda")
+        self.version = 0
+        self.version_tensor = torch.tensor([self.version], device="cuda")
+
+    def receive_from_trainer(self):
+        for v in self.state_dict.values():
+            torch.distributed.recv(v, src=0)
+
+    def acquire_state_dict_lock(self):
+        pass
+
+    def release_state_dict_lock(self):
+        pass
+
+    def _get_server_weights(self):
+        pass
+
+    def _maybe_map_weights(self, server_weights):
+        pass
+
+    def _sync_weights_with_worker(self, worker_id, server_weights):
+        pass
+
+    def all_worker_ids(self):
+        pass
 
 
 @pytest.fixture(params=[2, 1], autouse=True)
 def world_size(request):
-    size = request.param
+    size = request.param + 1  # add 1 for param server
     ray.init(num_cpus=4 * size, num_gpus=size)
     yield size
     ray.shutdown()
@@ -92,7 +131,7 @@ class TestAsyncGRPOTrainerWorker:
             ("llama3/8B_full", "llama3", "tune", 4, 1),
         ],
     )
-    @gpu_test(gpu_count=2)
+    @gpu_test(gpu_count=3)
     def test_loss(
         self,
         micro_batch_size,
@@ -139,19 +178,27 @@ class TestAsyncGRPOTrainerWorker:
         # Create Trainers
         trainers = []
         replay_buffer = [torch.randn((micro_batch_size, 100, 16)) for _ in range(10)]
-        for i in range(world_size):
+        ip, port = get_ip(), get_open_port()
+        num_trainers = world_size - 1
+        print(f"ip: {ip}, port: {port}")
+        for i in range(num_trainers):
             env_vars = {
                 "RANK": str(i),
-                "WORLD_SIZE": 2,
-                "MASTER_ADDR": get_ip(),
-                "MASTER_PORT": get_open_port(),
+                "WORLD_SIZE": world_size,
+                "MASTER_ADDR": ip,
+                "MASTER_PORT": port,
             }
             trainer = PyTorchActorModel.remote(
                 cfg,
                 env_vars,
-                replay_buffer[i::world_size],
+                replay_buffer[i::num_trainers],
             )
             trainers.append(trainer)
+
+        # Register dummy parameter server
+        env_vars["RANK"] = str(num_trainers)
+        param_server = DummyParamServer.remote(env_vars)
+        trainers[0].register_parameter_server.remote(param_server)
 
         # Add Metric Logging
         logger = MetricLoggerActor.remote(cfg)
@@ -159,6 +206,9 @@ class TestAsyncGRPOTrainerWorker:
         for worker in trainers:
             logger_handles.append(worker.set_metric_logger.remote(logger))
         ray.get(logger_handles)  # wait for all calls to complete
+
+        model_metadata = ray.get(trainers[0].get_model_metadata.remote())
+        param_server.register_model_metadata.remote(model_metadata)
 
         # Train
         trainer_handles = [worker.train.remote() for worker in trainers]
