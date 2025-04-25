@@ -94,8 +94,6 @@ def batched_rewards(
                 reward, success = reward_func(cot, answer, potential_answer)
                 rewards_tensor[b, g, rw_idx] += reward
                 successes_tensor[b, g, rw_idx] += success
-        print('successes_tensor for batch', successes_tensor[b])
-        raise RuntimeError(successes_tensor[b].sum(), "successes")
 
     return rewards_tensor, successes_tensor, metadata
 
