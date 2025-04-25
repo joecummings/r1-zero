@@ -111,8 +111,8 @@ class SyncLLMCollector(SyncDataCollector):
             policy=policy,
             frames_per_batch=dialog_turns_per_batch,
             total_frames=total_dialog_turns,
-            local_weight_updater=local_weight_updater,
-            remote_weight_updater=remote_weight_updater,
+            weight_update_receiver=local_weight_updater,
+            weight_update_sender=remote_weight_updater,
             reset_at_each_iter=reset_at_each_iter,
             use_buffers=False,
             # This argument allows a non-TensorDictModule policy to be assumed
@@ -180,7 +180,7 @@ class SyncLLMCollector(SyncDataCollector):
         worker_ids: int | list[int] | torch.device | list[torch.device] | None = None,
         **kwargs,
     ) -> None:
-        self.local_weight_updater(policy_weights, **kwargs)
+        self.weight_update_receiver(policy_weights, **kwargs)
 
     def set_metric_logger(self, logger):
         """Store the MetricLoggerActor handle."""
@@ -236,9 +236,9 @@ class SyncLLMCollector(SyncDataCollector):
             self.rollout(i)
             if i % self.cfg.vllm.steps_before_sync == 0:
                 print(
-                    f"{self.worker_id} about to update weights, {self.remote_weight_updater}"
+                    f"{self.worker_id} about to update weights, {self.weight_update_sender}"
                 )
-                self.remote_weight_updater.update_weights.remote(
+                self.weight_update_sender.update_weights.remote(
                     weights=None, worker_ids=self.worker_id
                 )
 
