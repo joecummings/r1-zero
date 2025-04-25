@@ -1,3 +1,9 @@
+# Copyright (c) Meta Platforms, Inc. and affiliates.
+# All rights reserved.
+#
+# This source code is licensed under the BSD-style license found in the
+# LICENSE file in the root directory of this source tree.
+
 import functools
 import os
 import time
@@ -25,8 +31,8 @@ from torchdata.stateful_dataloader import StatefulDataLoader
 from torchdata.stateful_dataloader.sampler import StatefulDistributedSampler
 
 from torchrl.data import LazyStackStorage, RayReplayBuffer
-from torchtune.dev.grpo.envs import LLMEnv
 from torchtune import config, generation, modules, rlhf, utils
+from torchtune.dev.grpo.envs import LLMEnv
 from torchtune.dev.grpo.rewards import batched_rewards
 from torchtune.dev.grpo.types import GRPOStats, GRPOTrajectory
 from torchtune.dev.rl.datatypes import Trajectory
@@ -380,6 +386,10 @@ class PyTorchActorModel:
         self, cfg_optimizer: DictConfig, opt_state_dict=None
     ) -> Optional[Optimizer]:
         """Initialize the optimizer."""
+        # TODO: remove this
+        print('Messing up params!')
+        for p in self._model.parameters():
+            p.data.copy_(p.data + torch.randn_like(p.data) * 0.1)
         optimizer = config.instantiate(cfg_optimizer, self._model.parameters())
 
         # TODO: does this work?
@@ -714,9 +724,9 @@ class PyTorchActorModel:
                 )
             else:
                 beyond_seq_len = 0
-            per_sample_dict["beyond_seq_len_masking_is_positive (should be 0)"] = (
-                beyond_seq_len
-            )
+            per_sample_dict[
+                "beyond_seq_len_masking_is_positive (should be 0)"
+            ] = beyond_seq_len
 
             per_sample_dict["num_tokens_response"] = seq_len
             per_sample_dict["step"] = self._steps_run

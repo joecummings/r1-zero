@@ -105,9 +105,6 @@ class VLLMParameterServer:
         read_lock.acquire()
         for i, k in enumerate(server_weights.keys()):
             p = server_weights[k]
-            if self.version_tensor <= 1:
-                print(f"Messing up params {k=}")
-                p.data = p.data + torch.randn_like(p.data) * 0.01
             self.vllm_comm_groups[worker_id].broadcast(
                 p, src=0, stream=torch.cuda.current_stream()
             )
