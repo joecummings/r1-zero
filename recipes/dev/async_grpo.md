@@ -60,6 +60,7 @@ pip install -e .[async_rl]
 With these installed you can run the recipe with
 
 ```bash
+tune download Qwen/Qwen2.5-3B --output-dir /tmp/Qwen2.5-3B --ignore-patterns "original/consolidated.00.pth"
 tune run dev/async_grpo_full_finetune_distributed --config recipes/configs/dev/qwen3B_async_grpo.yaml
 ```
 
