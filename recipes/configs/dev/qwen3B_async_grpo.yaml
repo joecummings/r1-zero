@@ -73,6 +73,8 @@ inference:
   total_batch_size: ${eval:'${inference.batch_size} * ${inference.group_size}'}
   steps_before_sync: 1
   queue_maxsize: ${eval:'${orchestration.num_inference_workers} * ${training.steps_before_sync}'}
+  # gpu_memory_utilization for vllm kv cache
+  gpu_memory_utilization: 0.9
 
 postprocessing:
   device_type: cuda

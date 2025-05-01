@@ -67,6 +67,7 @@ class SyncLLMCollector(SyncDataCollector):
 
         self.tp_size = self.cfg.inference.tp_size
         self.batch_size = self.cfg.inference.batch_size
+        self.gpu_memory_utilization = self.cfg.inference.gpu_memory_utilization
         self._sequence_counter = 0  # Used to assign unique sequence IDs to each sample
 
         self.inference_server = LLM(
@@ -76,6 +77,7 @@ class SyncLLMCollector(SyncDataCollector):
             dtype="bfloat16",
             worker_cls=VLLMWorkerWrapper,
             tensor_parallel_size=self.tp_size,
+            gpu_memory_utilization=self.gpu_memory_utilization,
         )
 
         # local import below LLM call to avoid vLLM no CUDA GPUs available error

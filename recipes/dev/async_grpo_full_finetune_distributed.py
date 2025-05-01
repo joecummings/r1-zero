@@ -319,13 +319,35 @@ class RayGRPORecipe(OrchestrationRecipeInterface):
             workers.append(worker)
         return workers
 
+    def _wait_for_completion(self, worker_handles, trainer_handles):
+        completed = []
+        while True:
+            ready, worker_handles = ray.wait(worker_handles, num_returns=1)
+            for handle in ready:
+                try:
+                    result = ray.get(handle)
+                except ray.exceptions.RayActorError as e:
+                    print(f"Actor error occurred: {e}")
+                    [
+                        ray.kill(w)
+                        for w in self.rollout_workers
+                        + self.ref_workers
+                        + self.actor_workers
+                    ]
+                    return
+            completed += ready
+            if set(completed) == set(trainer_handles):
+                [ray.kill(w) for w in self.rollout_workers + self.ref_workers]
+                ray.get(self.actor_workers[0].cleanup.remote())
+                return
+
     def run(self):
         rollout_handles = [worker.run.remote() for worker in self.rollout_workers]
         ref_handles = [worker.run.remote() for worker in self.ref_workers]
         worker_handles = [worker.train.remote() for worker in self.actor_workers]
-        ray.get(worker_handles)
-        [ray.kill(w) for w in self.rollout_workers + self.ref_workers]
-        ray.get(self.actor_workers[0].cleanup.remote())
+        self._wait_for_completion(
+            rollout_handles + ref_handles + worker_handles, worker_handles
+        )
 
     def stop_ray(self):
         ray.shutdown()
